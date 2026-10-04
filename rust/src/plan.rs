@@ -28,6 +28,8 @@ pub struct RawRequest {
     pub keyboard: String,
     pub desktops: Vec<crate::Desktop>,
     pub default_desktop: crate::Desktop,
+    #[serde(default = "crate::applications::default_selection")]
+    pub applications: Vec<String>,
     pub copy_wifi: bool,
     pub wifi_profiles: Vec<String>,
     pub allow_unfree: bool,
@@ -130,6 +132,7 @@ pub struct InstallPlan {
     timezone: TimeZone,
     keyboard: &'static str,
     desktops: DesktopSelection,
+    applications: crate::applications::ApplicationSelection,
     wifi: WifiTransfer,
     allow_unfree: bool,
 }
@@ -167,6 +170,10 @@ impl RawRequest {
         let timezone = TimeZone::parse(&self.timezone, Path::new(&settings.zoneinfo))?;
         let desktops =
             DesktopSelection::parse(std::mem::take(&mut self.desktops), self.default_desktop)?;
+        let applications = crate::applications::ApplicationSelection::parse(
+            std::mem::take(&mut self.applications),
+            self.allow_unfree,
+        )?;
         let wifi = WifiTransfer::parse(
             self.copy_wifi,
             std::mem::take(&mut self.wifi_profiles),
@@ -185,6 +192,7 @@ impl RawRequest {
             timezone,
             keyboard,
             desktops,
+            applications,
             wifi,
             allow_unfree: self.allow_unfree,
         })
@@ -233,6 +241,9 @@ impl InstallPlan {
     }
     pub fn wifi(&self) -> &WifiTransfer {
         &self.wifi
+    }
+    pub fn applications(&self) -> &crate::applications::ApplicationSelection {
+        &self.applications
     }
     pub fn allow_unfree(&self) -> bool {
         self.allow_unfree
@@ -296,6 +307,7 @@ impl ConfirmedInstall {
             keyboard: plan.keyboard.into(),
             desktops,
             default_desktop,
+            applications: plan.applications.ids(),
             copy_wifi,
             wifi_profiles,
             allow_unfree: plan.allow_unfree,

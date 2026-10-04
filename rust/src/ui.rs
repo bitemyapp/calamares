@@ -3,7 +3,7 @@
 //! authorization and installation all run on workers with bounded messages.
 use calamares_nixos::{
     ConfirmedInstall, Desktop, Filesystem, Firmware, InstallPlan, KEYBOARDS, LOCALES, RawRequest,
-    Settings,
+    Settings, applications,
     disk::{self, Disk},
     install::Event,
     timezone,
@@ -97,6 +97,133 @@ fn disk_index(selected: u32, count: usize) -> Option<usize> {
         .checked_sub(1)
         .map(|n| n as usize)
         .filter(|n| *n < count)
+}
+
+fn application_page(unfree: &CheckButton) -> (GtkBox, Vec<CheckButton>) {
+    let page = GtkBox::new(Orientation::Vertical, 12);
+    page.append(&label("Choose applications to have ready after installation. You can select any combination and sign in to your accounts later."));
+    let search = gtk::SearchEntry::builder()
+        .placeholder_text("Search applications")
+        .build();
+    page.append(&search);
+    let count = label("");
+    page.append(&count);
+    let checks: Vec<_> = applications::catalog()
+        .iter()
+        .map(|app| {
+            let check = CheckButton::with_label(&app.name);
+            check.set_active(app.id == "firefox");
+            check
+        })
+        .collect();
+    let mut groups = Vec::new();
+    let mut previous = "";
+    let mut group = GtkBox::new(Orientation::Vertical, 10);
+    let mut rows = Vec::new();
+    for (app, check) in applications::catalog().iter().zip(&checks) {
+        if app.category != previous {
+            if !rows.is_empty() {
+                groups.push((group, std::mem::take(&mut rows)));
+            }
+            group = GtkBox::new(Orientation::Vertical, 10);
+            let heading = label(&app.category);
+            heading.add_css_class("heading");
+            group.append(&heading);
+            page.append(&group);
+            previous = &app.category;
+        }
+        let item = GtkBox::new(Orientation::Vertical, 3);
+        item.append(check);
+        let description = label(&app.description);
+        description.set_margin_start(28);
+        item.append(&description);
+        let badges = [
+            app.terminal.as_ref().map(|_| "Terminal application"),
+            app.unfree.then_some("Proprietary software"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+        if !badges.is_empty() {
+            let badges = label(&badges);
+            badges.add_css_class("dim-label");
+            badges.set_margin_start(28);
+            item.append(&badges);
+        }
+        group.append(&item);
+        rows.push((
+            item,
+            format!("{} {} {}", app.name, app.description, app.category).to_lowercase(),
+        ));
+    }
+    groups.push((group, rows));
+    search.connect_search_changed(move |search| {
+        let query = search.text().to_lowercase();
+        for (group, rows) in &groups {
+            let mut visible = false;
+            for (row, text) in rows {
+                let matches = text.contains(query.trim());
+                row.set_visible(matches);
+                visible |= matches;
+            }
+            group.set_visible(visible);
+        }
+    });
+    let updating = Rc::new(Cell::new(false));
+    let refresh: Rc<dyn Fn()> = Rc::new({
+        let checks: Vec<_> = checks.iter().map(CheckButton::downgrade).collect();
+        let unfree = unfree.downgrade();
+        let count = count.downgrade();
+        move || {
+            if updating.replace(true) {
+                return;
+            }
+            if let (Some(unfree), Some(count)) = (unfree.upgrade(), count.upgrade()) {
+                let checks: Vec<_> = checks.iter().filter_map(glib::WeakRef::upgrade).collect();
+                if checks.len() == applications::catalog().len() {
+                    for (app, check) in applications::catalog().iter().zip(&checks) {
+                        if app.unfree && !unfree.is_active() {
+                            check.set_active(false);
+                        }
+                    }
+                    let required: std::collections::BTreeSet<_> = applications::catalog()
+                        .iter()
+                        .zip(&checks)
+                        .filter(|(_, check)| check.is_active())
+                        .flat_map(|(app, _)| app.requires.iter())
+                        .collect();
+                    for (app, check) in applications::catalog().iter().zip(&checks) {
+                        let needed = required.contains(&app.id);
+                        if needed {
+                            check.set_active(true);
+                        }
+                        check.set_sensitive((!app.unfree || unfree.is_active()) && !needed);
+                        check.set_tooltip_text(if needed { Some("Required by Rustup. Deselect Rustup to make this optional.") }
+                            else if app.unfree && !unfree.is_active() { Some("Enable unfree software on Desktops & Wi-Fi to select this application.") }
+                            else { None });
+                    }
+                    count.set_text(&format!(
+                        "{} selected · Rustup also selects Development build tools",
+                        checks.iter().filter(|check| check.is_active()).count()
+                    ));
+                }
+            }
+            updating.set(false);
+        }
+    });
+    for check in &checks {
+        check.connect_toggled({
+            let refresh = refresh.clone();
+            move |_| refresh()
+        });
+    }
+    unfree.connect_toggled({
+        let refresh = refresh.clone();
+        move |_| refresh()
+    });
+    refresh();
+    (page, checks)
 }
 
 pub fn build(app: &Application) {
@@ -258,6 +385,7 @@ pub fn build(app: &Application) {
     unfree.set_active(calamares_nixos::DEFAULT_ALLOW_UNFREE);
     desktop_page.append(&unfree);
     desktop_page.append(&label("Enabled by default. Redistributable firmware is included either way. Allowing unfree packages does not automatically configure every vendor driver."));
+    let (applications_page, applications) = application_page(&unfree);
     let next = Button::with_label("Review installation");
     next.add_css_class("suggested-action");
     let notebook = gtk::Notebook::new();
@@ -266,6 +394,7 @@ pub fn build(app: &Application) {
         ("System & account", &setup),
         ("Desktops & Wi-Fi", &desktop_page),
         ("Location", &location_page),
+        ("Applications", &applications_page),
     ] {
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -284,7 +413,12 @@ pub fn build(app: &Application) {
     let review = GtkBox::new(Orientation::Vertical, 18);
     let summary = label("");
     summary.set_selectable(true);
-    review.append(&summary);
+    let review_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&summary)
+        .build();
+    review.append(&review_scroll);
     let erase = entry("");
     erase.set_placeholder_text(Some("ERASE /dev/…"));
     review.append(&erase);
@@ -471,6 +605,11 @@ pub fn build(app: &Application) {
                     .get(default_desktop.selected() as usize)
                     .copied()
                     .unwrap_or(Desktop::Plasma),
+                applications: applications::catalog()
+                    .iter()
+                    .zip(&applications)
+                    .filter_map(|(app, check)| check.is_active().then_some(app.id.clone()))
+                    .collect(),
                 copy_wifi: copy_wifi.is_active(),
                 wifi_profiles: vec![],
                 allow_unfree: unfree.is_active(),
@@ -624,7 +763,8 @@ pub fn build(app: &Application) {
                                     .map(|d| d.label())
                                     .collect::<Vec<_>>()
                                     .join(", ");
-                                summary.set_text(&format!("ERASE ALL DATA ON {}\nModel: {} · Serial: {} · Size: {:.1} GiB\n\nDesktops: {}\nDefault session: {} · {:?} / {}\nHost: {} · User: {}\nLocale: {} · Time zone: {} · Keyboard: {}\nWi-Fi transfer: {} · {} saved profiles\nUnfree software: {}\n\nThe installation uses the media's pinned Determinate Nix flake. Root login is locked; your user can administer the system with sudo.\n\nType exactly: ERASE {}",r.disk().path,r.disk().model,r.disk().serial,r.disk().bytes as f64/1024f64.powi(3),desktop_names,r.desktops().default().label(),r.firmware(),r.filesystem().name(),r.hostname().as_str(),r.username().as_str(),r.locale(),r.timezone().as_str(),r.keyboard(),r.wifi().enabled(),r.wifi().profile_count(),r.allow_unfree(),r.disk().path));
+                                let application_names = r.applications().names();
+                                summary.set_text(&format!("ERASE ALL DATA ON {}\nModel: {} · Serial: {} · Size: {:.1} GiB\n\nDesktops: {}\nDefault session: {} · {:?} / {}\nHost: {} · User: {}\nLocale: {} · Time zone: {} · Keyboard: {}\nWi-Fi transfer: {} · {} saved profiles\nUnfree software: {}\nApplications: {}\n\nThe installation uses the media's pinned Determinate Nix flake. Root login is locked; your user can administer the system with sudo.\n\nType exactly: ERASE {}",r.disk().path,r.disk().model,r.disk().serial,r.disk().bytes as f64/1024f64.powi(3),desktop_names,r.desktops().default().label(),r.firmware(),r.filesystem().name(),r.hostname().as_str(),r.username().as_str(),r.locale(),r.timezone().as_str(),r.keyboard(),r.wifi().enabled(),r.wifi().profile_count(),r.allow_unfree(),if application_names.is_empty() { "None" } else { &application_names },r.disk().path));
                                 *pending.borrow_mut() = Some(*r);
                                 erase.set_text("");
                                 consent.set_active(false);

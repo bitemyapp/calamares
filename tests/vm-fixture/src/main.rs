@@ -124,6 +124,21 @@ fn selected_filesystem() -> Result<Filesystem> {
         std::env::var("CALAMARES_TEST_FILESYSTEM").unwrap_or_else(|_| "ext4".into()),
     ))?)
 }
+fn selected_applications() -> Vec<String> {
+    match std::env::var("CALAMARES_TEST_APPLICATIONS").as_deref() {
+        Ok("all") => calamares_nixos::applications::catalog()
+            .iter()
+            .map(|app| app.id.clone())
+            .collect(),
+        Ok("none") => vec![],
+        Ok(ids) => ids
+            .split(',')
+            .filter(|id| !id.is_empty())
+            .map(String::from)
+            .collect(),
+        Err(_) => calamares_nixos::applications::default_selection(),
+    }
+}
 fn request() -> Result<RawRequest> {
     Ok(RawRequest {
         disk: disk::vm_test_disk()?,
@@ -141,6 +156,7 @@ fn request() -> Result<RawRequest> {
             calamares_nixos::Desktop::Xfce,
         ],
         default_desktop: calamares_nixos::Desktop::Plasma,
+        applications: selected_applications(),
         copy_wifi: true,
         wifi_profiles: vec![TEST_WIFI.into()],
         allow_unfree: calamares_nixos::DEFAULT_ALLOW_UNFREE,
@@ -206,7 +222,11 @@ fn seed_previous_filesystem(device: &str) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("desktop-configurations") {
+    let operation = std::env::args().nth(1);
+    if matches!(
+        operation.as_deref(),
+        Some("desktop-configurations" | "application-configurations")
+    ) {
         // Non-destructive host-side generation for Nix module evaluation.
         // Produces the actual backend output, never a second implementation.
         use calamares_nixos::Desktop;
@@ -217,16 +237,59 @@ fn main() -> Result<()> {
             kernel: Kernel::Lts,
             test_diagnostics: false,
         };
-        let mut configs = std::collections::BTreeMap::new();
-        for bits in 1u8..64 {
-            let desktops: Vec<_> = Desktop::ALL
-                .iter()
-                .enumerate()
-                .filter_map(|(i, d)| (bits & (1 << i) != 0).then_some(*d))
-                .collect();
-            if desktops.contains(&Desktop::Gnome) && desktops.contains(&Desktop::Cinnamon) {
-                continue;
+        let mut cases = Vec::new();
+        if operation.as_deref() == Some("application-configurations") {
+            let catalog = calamares_nixos::applications::catalog();
+            for app in catalog {
+                cases.push((
+                    app.id.clone(),
+                    vec![Desktop::Plasma],
+                    vec![app.id.clone()],
+                    app.unfree,
+                ));
             }
+            cases.push(("none".into(), vec![Desktop::Plasma], vec![], false));
+            cases.push((
+                "all".into(),
+                vec![Desktop::Plasma],
+                catalog.iter().map(|app| app.id.clone()).collect(),
+                true,
+            ));
+            cases.push((
+                "free-only".into(),
+                vec![Desktop::Plasma],
+                catalog
+                    .iter()
+                    .filter(|app| !app.unfree)
+                    .map(|app| app.id.clone())
+                    .collect(),
+                false,
+            ));
+        } else {
+            for bits in 1u8..64 {
+                let desktops: Vec<_> = Desktop::ALL
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, d)| (bits & (1 << i) != 0).then_some(*d))
+                    .collect();
+                if desktops.contains(&Desktop::Gnome) && desktops.contains(&Desktop::Cinnamon) {
+                    continue;
+                }
+                let name = desktops
+                    .iter()
+                    .map(|d| d.session())
+                    .collect::<Vec<_>>()
+                    .join("-");
+                cases.push((
+                    name,
+                    desktops,
+                    calamares_nixos::applications::default_selection(),
+                    true,
+                ));
+            }
+        }
+        let mut configs = std::collections::BTreeMap::new();
+        for (name, desktops, applications, allow_unfree) in cases {
             let r = RawRequest {
                 disk: disk::Identity {
                     path: "/dev/vda".into(),
@@ -246,18 +309,13 @@ fn main() -> Result<()> {
                 timezone: "America/Chicago".into(),
                 keyboard: "us".into(),
                 default_desktop: desktops[0],
+                applications,
                 desktops,
                 copy_wifi: false,
                 wifi_profiles: vec![],
-                allow_unfree: calamares_nixos::DEFAULT_ALLOW_UNFREE,
+                allow_unfree,
                 confirmation: "ERASE /dev/vda".into(),
             };
-            let name = r
-                .desktops
-                .iter()
-                .map(|d| d.session())
-                .collect::<Vec<_>>()
-                .join("-");
             configs.insert(
                 name,
                 config::installed_configuration(
@@ -369,12 +427,25 @@ fn main() -> Result<()> {
             );
             let before = output("sha256sum", &["/etc/calamares-nixos/flake.lock"], 10)?;
             // Invalid wire inputs must fail before creating a partition table.
-            for invalid in ["username", "desktops", "wifi"] {
+            for invalid in [
+                "username",
+                "desktops",
+                "wifi",
+                "unknown-application",
+                "unfree-application",
+                "duplicate-application",
+            ] {
                 let mut bad = request()?;
                 match invalid {
                     "username" => bad.username = "root".into(),
                     "desktops" => bad.desktops.clear(),
                     "wifi" => bad.copy_wifi = false,
+                    "unknown-application" => bad.applications = vec!["not-an-application".into()],
+                    "unfree-application" => {
+                        bad.applications = vec!["google-chrome".into()];
+                        bad.allow_unfree = false;
+                    }
+                    "duplicate-application" => bad.applications = vec!["firefox".into(); 2],
                     _ => unreachable!(),
                 }
                 ensure!(invoke(bad, false).is_err(), "Accepted invalid {invalid}");
@@ -406,6 +477,32 @@ fn main() -> Result<()> {
             );
         }
         Some("verify") => {
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&fs::read("/etc/installer-applications.json")?)?;
+            let expected = calamares_nixos::applications::ApplicationSelection::parse(
+                selected_applications(),
+                true,
+            )?;
+            ensure!(
+                manifest["selected"] == serde_json::to_value(expected.ids())?,
+                "Installed applications differ from the reviewed selection"
+            );
+            for package in manifest["packages"]
+                .as_array()
+                .context("Missing application package manifest")?
+            {
+                ensure!(
+                    Path::new(
+                        package["path"]
+                            .as_str()
+                            .context("Missing application path")?
+                    )
+                    .is_dir(),
+                    "Missing selected package: {}",
+                    package["name"]
+                );
+            }
+            println!("APPLICATIONS={}", expected.ids().join(","));
             ensure!(
                 output("findmnt", &["-n", "-o", "FSTYPE", "/"], 10)?.trim()
                     == selected_filesystem()?.name(),

@@ -162,6 +162,61 @@ pub fn install(confirmed: ConfirmedInstall, mode: InstallMode) -> Result<()> {
         fs::read(staging.path().join("flake.lock"))? == template.lock,
         "Nix modified the pinned lock"
     );
+    progress(
+        0,
+        "Checking and downloading selected applications before erasing the disk",
+    );
+    fs::write(
+        staging.path().join("configuration.nix"),
+        config::configuration(&request),
+    )?;
+    // Application evaluation is independent of the target's future filesystems.
+    fs::write(
+        staging.path().join("hardware-configuration.nix"),
+        "{ ... }: {}\n",
+    )?;
+    output(
+        "nix",
+        &[
+            "build",
+            "--no-write-lock-file",
+            "--out-link",
+            staging.path().join("application-closure").to_str().unwrap(),
+            &format!(
+                "path:{}#nixosConfigurations.{}.config.system.build.installerApplications",
+                staging.path().display(),
+                request.hostname().as_str()
+            ),
+        ],
+        7200,
+    )
+    .context("Selected applications could not be prepared; the target disk has not been erased")?;
+    ensure!(
+        fs::read(staging.path().join("flake.lock"))? == template.lock,
+        "Application preparation modified the pinned lock"
+    );
+    let closure_info: serde_json::Value = serde_json::from_str(&output(
+        "nix",
+        &[
+            "path-info",
+            "--json",
+            "--closure-size",
+            staging.path().join("application-closure").to_str().unwrap(),
+        ],
+        120,
+    )?)?;
+    let closure_bytes = application_closure_size(&closure_info)?;
+    // Reserve room for the base OS, boot partition, and installation workspace.
+    // Shared dependencies make this deliberately conservative.
+    let required_bytes = closure_bytes
+        .checked_add(24 * 1024u64.pow(3))
+        .context("Application disk requirement overflow")?;
+    ensure!(
+        request.disk().bytes >= required_bytes,
+        "Selected applications need a disk of at least {:.1} GiB including system space; the selected disk has {:.1} GiB. Select fewer applications or a larger disk. No disk data has been changed.",
+        required_bytes as f64 / 1024f64.powi(3),
+        request.disk().bytes as f64 / 1024f64.powi(3)
+    );
     if mode == InstallMode::Preflight {
         progress(0, "Preflight passed; no disk writes were made");
         return Ok(());
@@ -337,9 +392,43 @@ pub fn install(confirmed: ConfirmedInstall, mode: InstallMode) -> Result<()> {
     Ok(())
 }
 
+fn application_closure_size(value: &serde_json::Value) -> Result<u64> {
+    let entries: Vec<_> = match value {
+        serde_json::Value::Array(entries) => entries.iter().collect(),
+        serde_json::Value::Object(entries) => entries.values().collect(),
+        _ => anyhow::bail!("Invalid application closure information"),
+    };
+    ensure!(entries.len() == 1, "Expected one application closure");
+    entries[0]["closureSize"]
+        .as_u64()
+        .context("Missing application closure size")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn closure_size_accepts_nix_json_formats_and_rejects_incomplete_results() {
+        assert_eq!(
+            application_closure_size(&serde_json::json!([{ "closureSize": 123 }])).unwrap(),
+            123
+        );
+        assert_eq!(
+            application_closure_size(
+                &serde_json::json!({ "/nix/store/example": { "closureSize": 456 } })
+            )
+            .unwrap(),
+            456
+        );
+        for value in [
+            serde_json::json!([]),
+            serde_json::json!([{}]),
+            serde_json::json!([{"closureSize":-1}]),
+            serde_json::json!([{}, {}]),
+        ] {
+            assert!(application_closure_size(&value).is_err());
+        }
+    }
     #[test]
     fn cleanup_never_recursively_deletes_contents() {
         let outer = tempfile::tempdir().unwrap();

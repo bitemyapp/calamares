@@ -167,9 +167,11 @@ pub fn vm_test_disk() -> Result<Identity> {
     let mut matches = discover()?.into_iter().filter(|d| {
         ["/dev/vda", "/dev/nvme0n1"].contains(&d.identity.path.as_str())
             && d.identity.serial == "RESPIN_TEST_ONLY"
-            && d.identity.bytes == 40 * 1024u64.pow(3)
+            && [40 * 1024u64.pow(3), 80 * 1024u64.pow(3)].contains(&d.identity.bytes)
     });
-    let disk = matches.next().context("Missing marked 40 GiB VM disk")?;
+    let disk = matches
+        .next()
+        .context("Missing marked 40 or 80 GiB VM disk")?;
     ensure!(matches.next().is_none(), "Multiple VM test disks");
     Ok(disk.identity)
 }

@@ -219,3 +219,38 @@ repository's [verification report](https://github.com/bitemyapp/determinate-nixo
 Artifacts and disposable disks stay under ignored `artifacts/` and `.work/`.
 No host sudo, real block-device write, physical USB modification or host reboot
 is needed for these tests.
+
+## Optional applications
+
+The Applications tab offers a searchable, categorized list with short descriptions.
+Firefox is selected initially; an empty selection is valid. The packaged catalog
+in `rust/src/applications.json` is shared by the GUI, privileged parser, and Nix
+module. Unknown IDs, duplicates, and proprietary choices without consent are
+rejected before installation. Rustup adds Development build tools before review
+and again when the helper parses the request. Required build tools cannot be
+deselected in the GUI while Rustup is selected.
+
+The build-tools choice includes wrapped GCC/G++ and libc headers, GNU Make,
+binutils, CMake, Ninja, pkg-config, Git, and patch. Rustup uses Nixpkgs' NixOS-aware
+package; users select a toolchain with `rustup default stable` after installation.
+Additional native libraries should be provided by a project development shell.
+Docker Engine + Compose uses the rootless user service with lingering enabled;
+it does not grant membership in the privileged `docker` group. OrbStack itself
+is macOS-only.
+
+The target flake supplies independently pinned application Nixpkgs, Numtide's
+`llm-agents.nix`, and upstream oh-my-pi. Its full lock is preserved. Both app
+catalog and module are copied into `/etc/nixos` with the selected IDs in
+`configuration.nix`; installed versions and store paths are recorded in
+`/etc/installer-applications.json`. Terminal applications receive menu launchers.
+
+Before the first disk write, the helper builds and roots the selected package
+closure, checks its size, and reserves an additional 24 GiB for the operating
+system and installation workspace. Failure at this stage leaves disk contents
+unchanged. The integrated ISO caches the complete catalog in its read-only store
+so application preparation does not require downloading a large closure into
+live-session RAM. This does not make the complete OS installation offline.
+
+Application test runs may use an 80 GiB image in addition to the original 40 GiB
+image. Both require the exact `RESPIN_TEST_ONLY` serial and expected VM device
+path before privileged diagnostics can run.

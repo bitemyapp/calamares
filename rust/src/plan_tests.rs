@@ -32,6 +32,7 @@ fn fixture() -> (tempfile::TempDir, Settings, RawRequest) {
         keyboard: "us".into(),
         desktops: vec![Desktop::Plasma],
         default_desktop: Desktop::Plasma,
+        applications: applications::default_selection(),
         copy_wifi: false,
         wifi_profiles: vec![],
         allow_unfree: false,
@@ -76,6 +77,51 @@ fn ipc_downgrades_to_raw_and_helper_parses_again() {
     let mut received: RawRequest = serde_json::from_slice(&json).unwrap();
     received.username = "root".into();
     assert!(received.parse_confirmed(&settings).is_err());
+}
+
+#[test]
+fn application_choices_survive_review_and_privileged_reparsing() {
+    let (_dir, settings, mut raw) = fixture();
+    raw.applications = vec!["rustup".into(), "codex".into()];
+    let plan = raw.parse(&settings).unwrap();
+    assert_eq!(
+        plan.applications().ids(),
+        ["codex", "build-tools", "rustup"]
+    );
+    let expected = config::configuration(&plan);
+    let wire = plan.confirm("ERASE /dev/vda").unwrap().into_request();
+    let encoded = serde_json::to_vec(&wire).unwrap();
+    let received: RawRequest = serde_json::from_slice(&encoded).unwrap();
+    let parsed = received.parse_confirmed(&settings).unwrap().into_plan();
+    assert_eq!(config::configuration(&parsed), expected);
+    assert!(
+        expected.contains("calamares.applications = [ \"codex\" \"build-tools\" \"rustup\" ];")
+    );
+    let mut received: RawRequest = serde_json::from_slice(&encoded).unwrap();
+    received.applications.push("google-chrome".into());
+    assert!(received.parse_confirmed(&settings).is_err());
+}
+
+#[test]
+fn omitted_applications_preserve_old_requests_but_empty_means_none() {
+    let (_dir, settings, mut raw) = fixture();
+    raw.applications.clear();
+    let mut wire = serde_json::to_value(&raw).unwrap();
+    let parsed: RawRequest = serde_json::from_value(wire.clone()).unwrap();
+    assert!(
+        parsed
+            .parse(&settings)
+            .unwrap()
+            .applications()
+            .selected()
+            .is_empty()
+    );
+    wire.as_object_mut().unwrap().remove("applications");
+    let parsed: RawRequest = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        parsed.parse(&settings).unwrap().applications().ids(),
+        ["firefox"]
+    );
 }
 
 #[test]

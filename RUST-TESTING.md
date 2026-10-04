@@ -23,8 +23,9 @@ an orderly shutdown and a boot with **no ISO attached**.
 | --- | --- | --- |
 | UEFI | `uefi-1791074916109-48874` | `f3h45hixda4zx0q87814gfrxz69in2rw` |
 | BIOS | `bios-1791075333637-50870` | `wcgx3laar7k88rw0nfh1rcqnxfa61v4p` |
+| UEFI, final package | `uefi-1791075670909-51959` | `091zgxadxyww1yvmzkj59611n7cwp0jn` |
 
-Both runs exercised the real Nix-packaged helper, wrong-erase-confirmation
+All three runs exercised the real Nix-packaged helper, wrong-erase-confirmation
 rejection without partitioning, non-destructive preflight, whole-disk
 installation, installed-system boot, and Determinate Nix 3.23.0 / Nix 2.35.2
 and `fh` 0.1.27. Installed-system checks included desktop services, root account

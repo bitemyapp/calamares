@@ -67,8 +67,34 @@ input by the installer.
 `calamares-nixos-helper` accepts a strict JSON request on stdin. The GUI starts
 it through NixOS's setuid Polkit wrapper, using a policy restricted to this
 executable. Passwords never appear in argv, process titles or progress messages.
-The backend independently validates all settings and requires root, NixOS,
+The backend independently parses the request and requires root, NixOS,
 a temporary root filesystem, a mounted live ISO and root-owned settings.
+
+### Parse once per process boundary
+
+The strict JSON `RawRequest` is only a transport/form object. Consuming it with
+`parse` produces an immutable `InstallPlan`; configuration generation accepts
+only that plan. `Hostname`, `Username`, and `TimeZone` retain checked values.
+`DesktopSelection` keeps the nonempty, unique, compatible selection together
+with a default that belongs to it. `WifiTransfer` represents either opt-out or
+a bounded collection of parsed, normalized profiles with unique connection
+identities. The writer uses those retained bytes, without parsing them again.
+
+Review does not fabricate an erase phrase. A separate consuming `confirm`
+transition binds the exact phrase to the plan's disk and returns
+`ConfirmedInstall`, the only input accepted by the executor. Serializing for
+IPC deliberately returns to raw data: the privileged helper independently
+parses and confirms it using its own root-owned settings. Neither plan type
+implements `Deserialize`, `Debug`, or `Clone`; password/profile owners zeroize
+their Rust buffers when dropped. External GTK/libnm allocations are not claimed
+to be zeroized.
+
+This is intentionally not a type for every string or process step. Full names
+remain strings; locale/keyboard choices resolve to allowed static values;
+cross-field rules belong in aggregate constructors. Runtime checks still guard
+live/root status, current firmware, mount state and disk identity immediately
+before writes. A parsed plan describes intent, not permanently safe hardware.
+Parsing that reads tzdata or calls libnm runs on workers, not the GTK thread.
 
 No target is selected automatically. The review page requires both a destructive
 checkbox and typing `ERASE /dev/<device>`. Before writing, the helper rechecks

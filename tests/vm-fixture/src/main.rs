@@ -2,7 +2,9 @@
 //! Separate test crate. Never shipped in the installer package.
 //! Fixed public test credentials, only inside serial/size/live-root guarded VMs.
 use anyhow::{Context, Result, ensure};
-use calamares_nixos::{Firmware, Kernel, Request, Settings, config, disk, process::output};
+use calamares_nixos::{
+    Firmware, Hostname, Kernel, RawRequest, Settings, config, disk, process::output,
+};
 use std::{
     fs,
     io::Write,
@@ -14,7 +16,23 @@ use std::{
 const PASSWORD: &str = "Qemu-Only-Test-123!";
 // Public synthetic network, no real wireless credentials or host NM access.
 const TEST_WIFI: &str = "[connection]\nid=Installer synthetic WiFi\nuuid=135ea3d9-d456-44b1-ae42-1e7081f66666\ntype=wifi\npermissions=user:nixos:;\n[wifi]\nssid=Installer synthetic WiFi\nmode=infrastructure\n[wifi-security]\nkey-mgmt=wpa-psk\npsk=WiFi-Synthetic-Only-123!\npsk-flags=0\n[ipv4]\nmethod=auto\n[ipv6]\nmethod=auto\n";
-fn invoke(request: Request, preflight: bool) -> Result<()> {
+// The host-side matrix now exercises the same parser as installation. Use real
+// tzdata both on development hosts and the rootless Nix builder/live ISO.
+fn zoneinfo() -> Result<std::path::PathBuf> {
+    for root in ["/usr/share/zoneinfo", "/etc/zoneinfo"] {
+        if Path::new(root).join("America/Chicago").is_file() {
+            return Ok(root.into());
+        }
+    }
+    fs::read_dir("/nix/store")?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().contains("-tzdata-"))
+        .map(|entry| entry.path().join("share/zoneinfo"))
+        .find(|path| path.join("America/Chicago").is_file())
+        .context("No tzdata found for the test fixture")
+}
+
+fn invoke(request: RawRequest, preflight: bool) -> Result<()> {
     let package = fs::read_to_string("/run/calamares-package-path")?;
     let helper = if std::env::var_os("CALAMARES_VM_DEV_BACKEND").is_some() {
         Path::new("/workspace/rust/target/x86_64-unknown-linux-musl/release/calamares-nixos-helper")
@@ -108,8 +126,8 @@ fn guard() -> Result<()> {
     );
     Ok(())
 }
-fn request() -> Result<Request> {
-    Ok(Request {
+fn request() -> Result<RawRequest> {
+    Ok(RawRequest {
         disk: disk::discover()?
             .into_iter()
             .find(|d| d.identity.path == "/dev/vda")
@@ -141,7 +159,7 @@ fn main() -> Result<()> {
         use calamares_nixos::Desktop;
         let settings = Settings {
             template_dir: "/unused".into(),
-            zoneinfo: "/unused".into(),
+            zoneinfo: zoneinfo()?.to_string_lossy().into_owned(),
             state_version: "26.11".into(),
             kernel: Kernel::Lts,
             test_diagnostics: false,
@@ -156,7 +174,7 @@ fn main() -> Result<()> {
             if desktops.contains(&Desktop::Gnome) && desktops.contains(&Desktop::Cinnamon) {
                 continue;
             }
-            let r = Request {
+            let r = RawRequest {
                 disk: disk::Identity {
                     path: "/dev/vda".into(),
                     major_minor: "252:0".into(),
@@ -186,7 +204,7 @@ fn main() -> Result<()> {
                 .map(|d| d.session())
                 .collect::<Vec<_>>()
                 .join("-");
-            configs.insert(name, config::configuration(&r, &settings));
+            configs.insert(name, config::configuration(&r.parse(&settings)?));
         }
         println!("{}", serde_json::to_string_pretty(&configs)?);
         return Ok(());
@@ -202,7 +220,7 @@ fn main() -> Result<()> {
             // diagnostics in this guarded VM; never mutate a Nix store file.
             let mut settings = Settings::load()?;
             ensure!(!settings.test_diagnostics, "Diagnostics shipped enabled");
-            config::Template::load(&settings, "rust-test")?;
+            config::Template::load(&settings, &Hostname::parse("rust-test")?)?;
             let helper =
                 Path::new("/run/current-system/sw/bin/calamares-nixos-helper").canonicalize()?;
             let package = helper.parent().unwrap().parent().unwrap();
@@ -270,12 +288,7 @@ fn main() -> Result<()> {
             // Locate the live tzdata through the root-owned localtime link.
             // The live ISO can leave /etc/localtime unset. Find its trusted
             // store tzdata for this fixture; production settings pin the path.
-            let zones = fs::read_dir("/nix/store")?
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.file_name().to_string_lossy().contains("-tzdata-"))
-                .map(|entry| entry.path().join("share/zoneinfo"))
-                .find(|path| path.join("Etc/UTC").is_file())
-                .context("Live ISO contains no tzdata store path")?;
+            let zones = zoneinfo()?;
             let settings = Settings {
                 zoneinfo: zones.to_string_lossy().into_owned(),
                 ..settings
@@ -293,7 +306,21 @@ fn main() -> Result<()> {
                 "Refusing an initialized test disk"
             );
             let before = output("sha256sum", &["/etc/calamares-nixos/flake.lock"], 10)?;
-            // Bad confirmation must fail without creating a partition table.
+            // Invalid wire inputs must fail before creating a partition table.
+            for invalid in ["username", "desktops", "wifi"] {
+                let mut bad = request()?;
+                match invalid {
+                    "username" => bad.username = "root".into(),
+                    "desktops" => bad.desktops.clear(),
+                    "wifi" => bad.copy_wifi = false,
+                    _ => unreachable!(),
+                }
+                ensure!(invoke(bad, false).is_err(), "Accepted invalid {invalid}");
+                ensure!(
+                    output("blkid", &["-p", "/dev/vda"], 10).is_err(),
+                    "Negative {invalid} test wrote to disk"
+                );
+            }
             let mut bad = request()?;
             bad.confirmation = "ERASE /dev/not-the-disk".into();
             ensure!(

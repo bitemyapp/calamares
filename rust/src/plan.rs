@@ -1,0 +1,296 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! Parse at process boundaries; keep the result, not just a successful check.
+//! Plans are immutable and deliberately neither Deserialize nor Debug/Clone.
+//! They describe reviewed intent, not a promise that a disk is still safe.
+use crate::{
+    Firmware, KEYBOARDS, LOCALES, Settings, desktop::DesktopSelection, disk, timezone::TimeZone,
+    wifi::WifiTransfer,
+};
+use anyhow::{Result, ensure};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use zeroize::{Zeroize, Zeroizing};
+
+/// Untrusted form/wire data. The JSON protocol is unchanged.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawRequest {
+    pub disk: disk::Identity,
+    pub firmware: Firmware,
+    pub hostname: String,
+    pub username: String,
+    pub full_name: String,
+    pub password: String,
+    pub locale: String,
+    pub timezone: String,
+    pub keyboard: String,
+    pub desktops: Vec<crate::Desktop>,
+    pub default_desktop: crate::Desktop,
+    pub copy_wifi: bool,
+    pub wifi_profiles: Vec<String>,
+    pub allow_unfree: bool,
+    pub confirmation: String,
+}
+impl Drop for RawRequest {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        self.wifi_profiles.zeroize();
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hostname(String);
+impl Hostname {
+    pub fn parse(value: &str) -> Result<Self> {
+        let bytes = value.as_bytes();
+        ensure!(
+            !bytes.is_empty()
+                && bytes.len() <= 63
+                && bytes[0].is_ascii_alphanumeric()
+                && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+                && bytes
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'-'),
+            "Hostname must be one DNS label (letters, numbers and interior hyphens)"
+        );
+        Ok(Self(value.into()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Username(String);
+impl Username {
+    pub fn parse(value: &str) -> Result<Self> {
+        let bytes = value.as_bytes();
+        ensure!(
+            !bytes.is_empty()
+                && bytes.len() <= 31
+                && bytes[0].is_ascii_lowercase()
+                && bytes.iter().all(|b| b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || *b == b'-'
+                    || *b == b'_'),
+            "Username must start with a lowercase letter and contain only lowercase letters, digits, hyphens or underscores"
+        );
+        ensure!(
+            ![
+                "root",
+                "nixos",
+                "daemon",
+                "nobody",
+                "systemd-network",
+                "messagebus",
+                "sshd",
+                "polkituser",
+                "sddm",
+                "nixbld"
+            ]
+            .contains(&value)
+                && !value.starts_with("nixbld"),
+            "Reserved username"
+        );
+        Ok(Self(value.into()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Parsed intent. Only constructors in this module can establish its invariants.
+/// Configuration generation cannot accept wire data:
+/// ```compile_fail
+/// use calamares_nixos::{RawRequest, config};
+/// fn bypass(raw: RawRequest) { config::configuration(&raw); }
+/// ```
+/// A serialized GUI plan is not proof of validation in the privileged process:
+/// ```compile_fail
+/// use calamares_nixos::InstallPlan;
+/// let plan: InstallPlan = serde_json::from_str("{}").unwrap();
+/// ```
+/// Read-only access cannot change the selected disk after confirmation:
+/// ```compile_fail
+/// use calamares_nixos::InstallPlan;
+/// fn retarget(plan: &mut InstallPlan) { plan.disk().path.clear(); }
+/// ```
+pub struct InstallPlan {
+    settings: Settings,
+    disk: disk::Identity,
+    firmware: Firmware,
+    hostname: Hostname,
+    username: Username,
+    full_name: String,
+    password: Zeroizing<String>,
+    locale: &'static str,
+    timezone: TimeZone,
+    keyboard: &'static str,
+    desktops: DesktopSelection,
+    wifi: WifiTransfer,
+    allow_unfree: bool,
+}
+
+impl RawRequest {
+    /// Parse for review; confirmation is intentionally a separate transition.
+    /// Called on a worker: timezone and Wi-Fi parsing can perform I/O/FFI.
+    pub fn parse(mut self, settings: &Settings) -> Result<InstallPlan> {
+        let hostname = Hostname::parse(&self.hostname)?;
+        let username = Username::parse(&self.username)?;
+        ensure!(
+            self.full_name.len() <= 128
+                && !self.full_name.contains(':')
+                && !self.full_name.chars().any(char::is_control),
+            "Invalid full name"
+        );
+        ensure!(
+            self.password.chars().count() >= 12
+                && self.password.len() <= 1024
+                && !self.password.chars().any(char::is_control),
+            "Password must have at least 12 characters, at most 1024 bytes, and no control characters"
+        );
+        // These closed UI choices need no separate wrapper types: store only
+        // the matching static value, never the unchecked input string.
+        let locale = LOCALES
+            .iter()
+            .copied()
+            .find(|v| *v == self.locale)
+            .ok_or_else(|| anyhow::anyhow!("Unsupported locale"))?;
+        let keyboard = KEYBOARDS
+            .iter()
+            .copied()
+            .find(|v| *v == self.keyboard)
+            .ok_or_else(|| anyhow::anyhow!("Unsupported keyboard layout"))?;
+        let timezone = TimeZone::parse(&self.timezone, Path::new(&settings.zoneinfo))?;
+        let desktops =
+            DesktopSelection::parse(std::mem::take(&mut self.desktops), self.default_desktop)?;
+        let wifi = WifiTransfer::parse(
+            self.copy_wifi,
+            std::mem::take(&mut self.wifi_profiles),
+            &username,
+        )?;
+        Ok(InstallPlan {
+            settings: settings.clone(),
+            disk: self.disk.clone(),
+            firmware: self.firmware,
+            hostname,
+            username,
+            full_name: std::mem::take(&mut self.full_name),
+            password: Zeroizing::new(std::mem::take(&mut self.password)),
+            locale,
+            timezone,
+            keyboard,
+            desktops,
+            wifi,
+            allow_unfree: self.allow_unfree,
+        })
+    }
+
+    /// The helper independently parses every byte received over stdin.
+    pub fn parse_confirmed(mut self, settings: &Settings) -> Result<ConfirmedInstall> {
+        let phrase = std::mem::take(&mut self.confirmation);
+        self.parse(settings)?.confirm(&phrase)
+    }
+}
+
+impl InstallPlan {
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+    pub fn disk(&self) -> &disk::Identity {
+        &self.disk
+    }
+    pub fn firmware(&self) -> Firmware {
+        self.firmware
+    }
+    pub fn hostname(&self) -> &Hostname {
+        &self.hostname
+    }
+    pub fn username(&self) -> &Username {
+        &self.username
+    }
+    pub fn full_name(&self) -> &str {
+        &self.full_name
+    }
+    pub fn locale(&self) -> &str {
+        self.locale
+    }
+    pub fn timezone(&self) -> &TimeZone {
+        &self.timezone
+    }
+    pub fn keyboard(&self) -> &str {
+        self.keyboard
+    }
+    pub fn desktops(&self) -> &DesktopSelection {
+        &self.desktops
+    }
+    pub fn wifi(&self) -> &WifiTransfer {
+        &self.wifi
+    }
+    pub fn allow_unfree(&self) -> bool {
+        self.allow_unfree
+    }
+    pub(crate) fn take_password(&mut self) -> Zeroizing<String> {
+        Zeroizing::new(std::mem::take(&mut *self.password))
+    }
+
+    /// Populate the reviewed plan from the live user before privilege elevation.
+    #[cfg(feature = "network")]
+    pub fn snapshot_wifi(mut self) -> Result<Self> {
+        if self.wifi.enabled() {
+            self.wifi = WifiTransfer::parse(true, crate::wifi::snapshot()?, &self.username)?;
+        }
+        Ok(self)
+    }
+
+    /// Pure, cheap comparison: safe in a GUI callback. This is not authorization
+    /// or a disk-state proof; the helper repeats parsing and the live checks.
+    pub fn confirm(self, phrase: &str) -> Result<ConfirmedInstall> {
+        ensure!(
+            phrase == format!("ERASE {}", self.disk.path),
+            "Type ERASE followed by the selected device path to confirm"
+        );
+        Ok(ConfirmedInstall(self))
+    }
+}
+
+/// Only a matching erase phrase can produce this value.
+/// ```compile_fail
+/// use calamares_nixos::{InstallPlan, install::{self, InstallMode}};
+/// fn bypass(plan: InstallPlan) { install::install(plan, InstallMode::Execute).unwrap(); }
+/// ```
+/// ```compile_fail
+/// use calamares_nixos::ConfirmedInstall;
+/// let confirmed: ConfirmedInstall = serde_json::from_str("{}").unwrap();
+/// ```
+pub struct ConfirmedInstall(InstallPlan);
+impl ConfirmedInstall {
+    pub(crate) fn into_plan(self) -> InstallPlan {
+        self.0
+    }
+
+    /// Downgrade at IPC: the receiver must parse and confirm it again. Secrets
+    /// remain in zeroizing owners until moved into the short-lived wire DTO.
+    pub fn into_request(self) -> RawRequest {
+        let mut plan = self.0;
+        let (copy_wifi, wifi_profiles) = plan.wifi.into_raw();
+        let (desktops, default_desktop) = plan.desktops.into_raw();
+        RawRequest {
+            confirmation: format!("ERASE {}", plan.disk.path),
+            disk: plan.disk,
+            firmware: plan.firmware,
+            hostname: plan.hostname.0,
+            username: plan.username.0,
+            full_name: plan.full_name,
+            password: std::mem::take(&mut *plan.password),
+            locale: plan.locale.into(),
+            timezone: plan.timezone.as_str().into(),
+            keyboard: plan.keyboard.into(),
+            desktops,
+            default_desktop,
+            copy_wifi,
+            wifi_profiles,
+            allow_unfree: plan.allow_unfree,
+        }
+    }
+}

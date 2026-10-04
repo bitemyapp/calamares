@@ -2,10 +2,10 @@
 //! GTK owns widgets only. Filesystem discovery, validation, password hashing,
 //! authorization and installation all run on workers with bounded messages.
 use calamares_nixos::{
-    Desktop, Firmware, KEYBOARDS, LOCALES, Request, Settings,
+    ConfirmedInstall, Desktop, Firmware, InstallPlan, KEYBOARDS, LOCALES, RawRequest, Settings,
     disk::{self, Disk},
     install::Event,
-    timezone, wifi,
+    timezone,
 };
 use gtk::{
     Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, DropDown, Entry, Label,
@@ -24,13 +24,13 @@ use zeroize::Zeroizing;
 
 enum Message {
     Scanned(Result<(Vec<Disk>, Firmware), String>),
-    Reviewed(Result<Box<Request>, String>),
+    Reviewed(Result<Box<InstallPlan>, String>),
     Event(Event),
     Finished(Result<(), String>),
     Zone(u64, Result<timezone::Detection, String>),
 }
 
-fn launch(request: Request, send: SyncSender<Message>) -> anyhow::Result<()> {
+fn launch(confirmed: ConfirmedInstall, send: SyncSender<Message>) -> anyhow::Result<()> {
     let helper = std::env::current_exe()?
         .parent()
         .unwrap()
@@ -42,6 +42,7 @@ fn launch(request: Request, send: SyncSender<Message>) -> anyhow::Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
+    let request = confirmed.into_request();
     let encoded = Zeroizing::new(serde_json::to_vec(&request)?);
     let input_result = child.stdin.take().unwrap().write_all(&encoded);
     drop(encoded);
@@ -356,7 +357,7 @@ pub fn build(app: &Application) {
     });
     let disks = Rc::new(RefCell::new(Vec::<Disk>::new()));
     let firmware = Rc::new(Cell::new(Firmware::Bios));
-    let pending = Rc::new(RefCell::new(None::<Request>));
+    let pending = Rc::new(RefCell::new(None::<InstallPlan>));
     let busy = Rc::new(Cell::new(false));
     let installing = Rc::new(Cell::new(false));
     let rescan: Rc<dyn Fn()> = Rc::new({
@@ -426,8 +427,8 @@ pub fn build(app: &Application) {
                 );
                 return;
             }
-            let request = Request {
-                confirmation: format!("ERASE {}", disk.identity.path),
+            let request = RawRequest {
+                confirmation: String::new(),
                 disk: disk.identity,
                 firmware: firmware.get(),
                 hostname: hostname.text().into(),
@@ -458,16 +459,10 @@ pub fn build(app: &Application) {
             scan.set_sensitive(false);
             let send = send.clone();
             thread::spawn(move || {
-                let result = (|| -> anyhow::Result<Box<Request>> {
-                    let mut request = request;
-                    let settings = Settings::load()?;
-                    calamares_nixos::validate(&request, &settings)?;
-                    disk::revalidate(&request.disk)?;
-                    if request.copy_wifi {
-                        request.wifi_profiles = wifi::snapshot()?;
-                    }
-                    calamares_nixos::validate(&request, &settings)?;
-                    Ok(Box::new(request))
+                let result = (|| -> anyhow::Result<Box<InstallPlan>> {
+                    let plan = request.parse(&Settings::load()?)?;
+                    disk::revalidate(plan.disk())?;
+                    Ok(Box::new(plan.snapshot_wifi()?))
                 })()
                 .map_err(|e| format!("{e:#}"));
                 let _ = send.send(Message::Reviewed(result));
@@ -485,7 +480,7 @@ pub fn build(app: &Application) {
                     && pending
                         .borrow()
                         .as_ref()
-                        .is_some_and(|r| erase.text() == format!("ERASE {}", r.disk.path)),
+                        .is_some_and(|r| erase.text() == format!("ERASE {}", r.disk().path)),
             );
         }
     });
@@ -505,13 +500,36 @@ pub fn build(app: &Application) {
         }
     });
     install.connect_clicked({
-        let send=send.clone(); let pending=pending.clone(); let busy=busy.clone(); let installing=installing.clone(); let spinner=spinner.clone(); let stack=stack.clone(); let status=status.clone();
-        let erase=erase.clone();
+        let send = send.clone();
+        let pending = pending.clone();
+        let busy = busy.clone();
+        let installing = installing.clone();
+        let spinner = spinner.clone();
+        let stack = stack.clone();
+        let status = status.clone();
+        let erase = erase.clone();
         move |_| {
-            let Some(mut request)=pending.borrow_mut().take() else { return; };
-            password.set_text(""); repeat.set_text("");
-            request.confirmation=erase.text().into(); busy.set(true); installing.set(true); spinner.start(); stack.set_visible_child_name("progress"); status.set_text("Waiting for authorization. The helper will repeat all safety checks before any disk write.");
-            let send=send.clone(); thread::spawn(move || { let outcome=launch(request,send.clone()).map_err(|e|format!("{e:#}")); let _=send.send(Message::Finished(outcome)); });
+            let Some(plan) = pending.borrow_mut().take() else { return; };
+            let confirmed = match plan.confirm(erase.text().as_str()) {
+                Ok(confirmed) => confirmed,
+                Err(error) => {
+                    stack.set_visible_child_name("setup");
+                    status.set_text(&error.to_string());
+                    return;
+                }
+            };
+            password.set_text("");
+            repeat.set_text("");
+            busy.set(true);
+            installing.set(true);
+            spinner.start();
+            stack.set_visible_child_name("progress");
+            status.set_text("Waiting for authorization. The helper will repeat all safety checks before any disk write.");
+            let send = send.clone();
+            thread::spawn(move || {
+                let outcome = launch(confirmed, send.clone()).map_err(|e| format!("{e:#}"));
+                let _ = send.send(Message::Finished(outcome));
+            });
         }
     });
     done.connect_clicked({
@@ -576,12 +594,13 @@ pub fn build(app: &Application) {
                         match result {
                             Ok(r) => {
                                 let desktop_names = r
-                                    .desktops
+                                    .desktops()
+                                    .selected()
                                     .iter()
                                     .map(|d| d.label())
                                     .collect::<Vec<_>>()
                                     .join(", ");
-                                summary.set_text(&format!("ERASE ALL DATA ON {}\nModel: {} · Serial: {} · Size: {:.1} GiB\n\nDesktops: {}\nDefault session: {} · {:?} / ext4\nHost: {} · User: {}\nLocale: {} · Time zone: {} · Keyboard: {}\nWi-Fi transfer: {} · {} saved profiles\nUnfree software: {}\n\nThe installation uses the media's pinned Determinate Nix flake. Root login is locked; your user can administer the system with sudo.\n\nType exactly: ERASE {}",r.disk.path,r.disk.model,r.disk.serial,r.disk.bytes as f64/1024f64.powi(3),desktop_names,r.default_desktop.label(),r.firmware,r.hostname,r.username,r.locale,r.timezone,r.keyboard,r.copy_wifi,r.wifi_profiles.len(),r.allow_unfree,r.disk.path));
+                                summary.set_text(&format!("ERASE ALL DATA ON {}\nModel: {} · Serial: {} · Size: {:.1} GiB\n\nDesktops: {}\nDefault session: {} · {:?} / ext4\nHost: {} · User: {}\nLocale: {} · Time zone: {} · Keyboard: {}\nWi-Fi transfer: {} · {} saved profiles\nUnfree software: {}\n\nThe installation uses the media's pinned Determinate Nix flake. Root login is locked; your user can administer the system with sudo.\n\nType exactly: ERASE {}",r.disk().path,r.disk().model,r.disk().serial,r.disk().bytes as f64/1024f64.powi(3),desktop_names,r.desktops().default().label(),r.firmware(),r.hostname().as_str(),r.username().as_str(),r.locale(),r.timezone().as_str(),r.keyboard(),r.wifi().enabled(),r.wifi().profile_count(),r.allow_unfree(),r.disk().path));
                                 *pending.borrow_mut() = Some(*r);
                                 erase.set_text("");
                                 consent.set_active(false);
@@ -625,7 +644,7 @@ pub fn build(app: &Application) {
                         if generation == zone_epoch.get() {
                             match result {
                                 Ok(found) => {
-                                    timezone.set_text(&found.zone);
+                                    timezone.set_text(found.zone.as_str());
                                     zone_status.set_text(&found.explanation);
                                 }
                                 Err(error) => zone_status.set_text(&error),

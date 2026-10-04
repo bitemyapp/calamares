@@ -4,12 +4,28 @@ These results concern the NixOS-focused Rust implementation, not upstream
 Calamares's distribution/plugin feature set. The first-release scope and
 limitations are in [RUST-INSTALLER.md](RUST-INSTALLER.md).
 
-## Current desktop, Wi-Fi and time-zone work
+## Parsed-plan refactor
 
-The current native package passes 21 tests (20 library tests and one GUI
-selection test), including desktop validation, NetworkManager keyfile/secret
-handling, private target files, and distinct Central/Eastern regional zones.
-Rustfmt and Clippy with warnings denied also pass. Full-image installation,
+Local locked Cargo tests pass: **26 runtime tests** (25 library, one GUI) and
+**six compile-fail doctests**. The no-default-features build passes 20 runtime
+tests and the same six compile-fail examples. Rustfmt and Clippy with warnings
+denied pass for both feature sets and the separate VM fixture.
+
+The tests cover the raw → parsed → confirmed → IPC → independently parsed helper
+transitions; retargeting rejection; all 64 desktop subsets against every default;
+hostname, user, password, ordinary-field and tzdata boundaries; and settings
+snapshot consistency. Compile-fail tests prohibit using raw input for rendering,
+deserializing either plan type, mutating the disk through shared access, invoking
+installation with an unconfirmed plan, and constructing unchecked Wi-Fi collections.
+Wi-Fi tests retain normalized bytes through writes and the IPC round trip,
+including permissions, secret flags and duplicate connection identity.
+The 47 generated configuration cases are byte-identical to the preceding
+installer (`680c510`): JSON SHA-256
+`0ed8a33800600707143798e9a99006be55ef2b1bef30e2b483413cdbc096227b`.
+
+The separate VM fixture additionally sends invalid usernames, empty desktop
+selections and opt-out/profile contradictions to the packaged helper, checking
+that none creates a partition table. Full-image installation,
 desktop matrix, Wi-Fi persistence and CST/CDT results are tracked with the exact
 installer commit and ISO checksum in the graphical integration repository's
 [TESTING.md](https://github.com/bitemyapp/determinate-nixos-graphical/blob/codex/rust-calamares-integration/TESTING.md).

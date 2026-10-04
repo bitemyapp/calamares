@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{
-    Firmware, Request, Settings,
+    ConfirmedInstall, Firmware, Settings,
     config::{self, Template},
     disk,
     process::output,
-    validate,
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -109,18 +108,24 @@ impl Drop for Target {
     }
 }
 
-pub fn install(mut request: Request, dry_run: bool) -> Result<()> {
-    let settings = Settings::load()?;
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InstallMode {
+    Preflight,
+    Execute,
+}
+
+pub fn install(confirmed: ConfirmedInstall, mode: InstallMode) -> Result<()> {
+    let mut request = confirmed.into_plan();
+    let settings = request.settings().clone();
     live_guard(&settings)?;
-    validate(&request, &settings)?;
     ensure!(
         !fs::read_to_string("/etc/passwd")?
             .lines()
-            .any(|l| l.split(':').next() == Some(request.username.as_str())),
+            .any(|l| l.split(':').next() == Some(request.username().as_str())),
         "Username is already reserved by the live system"
     );
     ensure!(
-        request.firmware == Firmware::current(),
+        request.firmware() == Firmware::current(),
         "Firmware changed since review"
     );
     let lock = fs::OpenOptions::new()
@@ -133,9 +138,9 @@ pub fn install(mut request: Request, dry_run: bool) -> Result<()> {
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
         "Another installation is already running"
     );
-    disk::revalidate(&request.disk)?;
-    let template = Template::load(&settings, &request.hostname)?;
-    let config = config::configuration(&request, &settings);
+    disk::revalidate(request.disk())?;
+    let template = Template::load(&settings, request.hostname())?;
+    let config = config::configuration(&request);
     progress(
         0,
         "Checking installation media, settings, target identity and pinned inputs",
@@ -160,37 +165,37 @@ pub fn install(mut request: Request, dry_run: bool) -> Result<()> {
         fs::read(staging.path().join("flake.lock"))? == template.lock,
         "Nix modified the pinned lock"
     );
-    if dry_run {
+    if mode == InstallMode::Preflight {
         progress(0, "Preflight passed; no disk writes were made");
         return Ok(());
     }
     let params = Sha512Params::new(100_000)
         .map_err(|e| anyhow::anyhow!("Password hashing parameters: {e:?}"))?;
+    let password = request.take_password();
     let hash = Zeroizing::new(
-        sha512_simple(&request.password, &params)
+        sha512_simple(&password, &params)
             .map_err(|_| anyhow::anyhow!("Password hashing failed"))?,
     );
-    use zeroize::Zeroize;
-    request.password.zeroize();
+    drop(password);
     // Lock while editing the partition table. Re-probe its stable identity and
     // all mount/holder state immediately before the first write.
     let device = fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&request.disk.path)?;
+        .open(&request.disk().path)?;
     ensure!(
         unsafe { libc::flock(device.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
         "Disk is locked by another installer"
     );
-    disk::revalidate(&request.disk)?;
-    let dev = request.disk.path.as_str();
+    disk::revalidate(request.disk())?;
+    let dev = request.disk().path.as_str();
     progress(
         1,
         "Erasing the selected disk and creating a GPT partition table",
     );
     output("wipefs", &["--all", "--force", dev], 60)?;
     output("parted", &["--script", dev, "mklabel", "gpt"], 60)?;
-    match request.firmware {
+    match request.firmware() {
         Firmware::Uefi => {
             output(
                 "parted",
@@ -212,7 +217,7 @@ pub fn install(mut request: Request, dry_run: bool) -> Result<()> {
             )?;
         }
     }
-    let start = if request.firmware == Firmware::Uefi {
+    let start = if request.firmware() == Firmware::Uefi {
         "1025MiB"
     } else {
         "3MiB"
@@ -242,7 +247,7 @@ pub fn install(mut request: Request, dry_run: bool) -> Result<()> {
     let mount = target.0.to_str().context("Target path encoding")?;
     output("mount", &[&root, mount], 30)?;
     target.1.set(true);
-    if request.firmware == Firmware::Uefi {
+    if request.firmware() == Firmware::Uefi {
         output("mkfs.fat", &["-F", "32", &boot], 60)?;
         fs::create_dir(target.0.join("boot"))?;
         output(
@@ -272,7 +277,7 @@ pub fn install(mut request: Request, dry_run: bool) -> Result<()> {
     fs::create_dir(&secret_dir)?;
     fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700))?;
     config::write_secret(&secret_dir.join("user-password.hash"), &hash)?;
-    crate::wifi::write_profiles(&target.0, &request.wifi_profiles, &request.username)?;
+    request.wifi().write_to(&target.0)?;
     progress(
         4,
         "Building and installing NixOS (downloads can take a while)",
@@ -283,7 +288,7 @@ pub fn install(mut request: Request, dry_run: bool) -> Result<()> {
             "--root",
             mount,
             "--flake",
-            &format!("path:{}#{}", dir.display(), request.hostname),
+            &format!("path:{}#{}", dir.display(), request.hostname().as_str()),
             "--no-root-passwd",
             "--no-channel-copy",
             "--option",

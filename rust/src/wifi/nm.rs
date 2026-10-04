@@ -79,7 +79,7 @@ fn serialize(connection: &Object) -> Result<KeyFile> {
     Ok(unsafe { from_glib_full(raw) })
 }
 
-pub fn snapshot() -> Result<Vec<String>> {
+pub(crate) fn snapshot() -> Result<Vec<String>> {
     let context = glib::MainContext::new();
     context.with_thread_default(|| -> Result<Vec<String>> {
         let bus = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE)
@@ -113,15 +113,18 @@ pub fn snapshot() -> Result<Vec<String>> {
                 }
             }
             let serialized = Zeroizing::new(serialize(&connection)?.to_data().to_string());
-            // Validate now; remap the restricted live user again in the helper.
-            let normalized = normalize(&serialized, "nixos")?;
-            profiles.push(normalized.to_string());
+            // The plan parser retains the normalized result for the target
+            // username. Do not normalize and discard it here first.
+            profiles.push(serialized.to_string());
         }
         Ok(std::mem::take(&mut *profiles))
     }).map_err(|_| anyhow::anyhow!("Cannot create the Wi-Fi worker context"))?
 }
 
-pub fn normalize(profile: &str, username: &str) -> Result<Zeroizing<String>> {
+pub(super) fn parse_profile(
+    profile: &str,
+    username: &crate::Username,
+) -> Result<super::WifiProfile> {
     ensure!(profile.len() <= 16384, "Wi-Fi profile exceeds size limit");
     let key = KeyFile::new();
     key.load_from_data(profile, KeyFileFlags::NONE)
@@ -167,7 +170,11 @@ pub fn normalize(profile: &str, username: &str) -> Result<Zeroizing<String>> {
         .string("connection", "permissions")
         .is_ok_and(|p| !p.is_empty())
     {
-        key.set_string("connection", "permissions", &format!("user:{username}:;"));
+        key.set_string(
+            "connection",
+            "permissions",
+            &format!("user:{}:;", username.as_str()),
+        );
     }
     // A transferred system keyfile owns its saved secret; the live wallet does
     // not exist in the target. Preserve intentionally NOT_REQUIRED secrets.
@@ -223,14 +230,23 @@ pub fn normalize(profile: &str, username: &str) -> Result<Zeroizing<String>> {
             .is_null(),
         "A Wi-Fi profile is missing credentials. Unlock the live wallet, save its password or disable transfer before continuing."
     );
-    Ok(Zeroizing::new(
-        serialize(&connection)?.to_data().to_string(),
-    ))
+    let normalized = serialize(&connection)?;
+    let uuid = normalized
+        .string("connection", "uuid")
+        .map_err(|_| anyhow::anyhow!("Missing Wi-Fi profile identity"))?
+        .to_string();
+    Ok(super::WifiProfile {
+        uuid,
+        keyfile: Zeroizing::new(normalized.to_data().to_string()),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn normalize(profile: &str, username: &str) -> Result<Zeroizing<String>> {
+        Ok(parse_profile(profile, &crate::Username::parse(username)?)?.keyfile)
+    }
     const WPA: &str = "[connection]\nid=Synthetic WiFi\nuuid=135ea3d9-d456-44b1-ae42-1e7081f66666\ntype=wifi\npermissions=user:nixos:;\n[wifi]\nssid=Test\\sSSID\\\\special\nmode=infrastructure\n[wifi-security]\nkey-mgmt=wpa-psk\npsk=WiFi-Synthetic-Only-123!\npsk-flags=1\n[ipv4]\nmethod=auto\n[ipv6]\nmethod=auto\n";
     #[test]
     fn secret_preserved_private_user_remapped_and_no_ethernet() {
@@ -260,21 +276,66 @@ mod tests {
         );
         assert!(normalize(&open, "alice").is_ok());
         assert!(normalize(&WPA.replace("wpa-psk", "sae"), "alice").is_ok());
-        assert!(super::super::validate_profiles(&[WPA.into(), WPA.into()], "alice").is_err());
+        assert!(
+            super::super::WifiTransfer::parse(
+                true,
+                vec![WPA.into(), WPA.into()],
+                &crate::Username::parse("alice").unwrap()
+            )
+            .is_err()
+        );
     }
     #[test]
     fn target_files_are_private_and_outside_flake() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
-        super::super::write_profiles(root.path(), &[WPA.into()], "alice").unwrap();
+        let transfer = super::super::WifiTransfer::parse(
+            true,
+            vec![WPA.into()],
+            &crate::Username::parse("alice").unwrap(),
+        )
+        .unwrap();
+        transfer.write_to(root.path()).unwrap();
         let file = root
             .path()
             .join("etc/NetworkManager/system-connections/installer-wifi-0.nmconnection");
         assert_eq!(
-            std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
             0o600
         );
         assert!(!root.path().join("etc/nixos").exists());
-        assert!(super::super::write_profiles(root.path(), &[WPA.into()], "alice").is_err());
+        let expected = normalize(WPA, "alice").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), *expected);
+        let (enabled, raw) = transfer.into_raw();
+        let transfer = super::super::WifiTransfer::parse(
+            enabled,
+            raw,
+            &crate::Username::parse("alice").unwrap(),
+        )
+        .unwrap();
+        let second = tempfile::tempdir().unwrap();
+        transfer.write_to(second.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(
+                second
+                    .path()
+                    .join("etc/NetworkManager/system-connections/installer-wifi-0.nmconnection")
+            )
+            .unwrap(),
+            *expected
+        );
+        assert!(transfer.write_to(root.path()).is_err());
+    }
+
+    #[test]
+    fn duplicate_detection_uses_parsed_connection_identity() {
+        let user = crate::Username::parse("alice").unwrap();
+        // Different display names still identify the same connection.
+        let other = WPA.replace("id=Synthetic WiFi", "id=Renamed connection");
+        let error = super::super::WifiTransfer::parse(true, vec![WPA.into(), other], &user)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(error, "Duplicate Wi-Fi profile identity");
     }
 }

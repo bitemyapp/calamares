@@ -3,17 +3,18 @@ pub mod config;
 pub mod desktop;
 pub mod disk;
 pub mod install;
+pub mod plan;
 pub mod process;
+pub use plan::{ConfirmedInstall, Hostname, InstallPlan, RawRequest, Username};
 pub mod timezone;
 pub mod wifi;
 pub use desktop::Desktop;
 #[cfg(test)]
-mod validation_tests;
+mod plan_tests;
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{fs, os::unix::fs::MetadataExt, path::Path};
-use zeroize::Zeroize;
 
 pub const SETTINGS: &str = "/etc/calamares-nixos/settings.json";
 
@@ -49,33 +50,6 @@ impl Firmware {
         } else {
             Self::Bios
         }
-    }
-}
-
-// Deliberately no Debug/Clone for a request containing a plaintext secret.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Request {
-    pub disk: disk::Identity,
-    pub firmware: Firmware,
-    pub hostname: String,
-    pub username: String,
-    pub full_name: String,
-    pub password: String,
-    pub locale: String,
-    pub timezone: String,
-    pub keyboard: String,
-    pub desktops: Vec<Desktop>,
-    pub default_desktop: Desktop,
-    pub copy_wifi: bool,
-    pub wifi_profiles: Vec<String>,
-    pub allow_unfree: bool,
-    pub confirmation: String,
-}
-impl Drop for Request {
-    fn drop(&mut self) {
-        self.password.zeroize();
-        self.wifi_profiles.zeroize();
     }
 }
 
@@ -139,94 +113,6 @@ impl Settings {
         );
         Ok(settings)
     }
-}
-
-pub fn validate(request: &Request, settings: &Settings) -> Result<()> {
-    let h = request.hostname.as_bytes();
-    ensure!(
-        !h.is_empty()
-            && h.len() <= 63
-            && h[0].is_ascii_alphanumeric()
-            && h[h.len() - 1].is_ascii_alphanumeric()
-            && h.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-'),
-        "Hostname must be one DNS label (letters, numbers and interior hyphens)"
-    );
-    let u = request.username.as_bytes();
-    ensure!(
-        !u.is_empty()
-            && u.len() <= 31
-            && u[0].is_ascii_lowercase()
-            && u.iter()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-' || *b == b'_'),
-        "Username must start with a lowercase letter and contain only lowercase letters, digits, hyphens or underscores"
-    );
-    ensure!(
-        ![
-            "root",
-            "nixos",
-            "daemon",
-            "nobody",
-            "systemd-network",
-            "messagebus",
-            "sshd",
-            "polkituser",
-            "sddm",
-            "nixbld"
-        ]
-        .contains(&request.username.as_str())
-            && !request.username.starts_with("nixbld"),
-        "Reserved username"
-    );
-    ensure!(
-        request.full_name.len() <= 128
-            && !request.full_name.contains(':')
-            && !request.full_name.chars().any(char::is_control),
-        "Invalid full name"
-    );
-    ensure!(
-        request.password.chars().count() >= 12
-            && request.password.len() <= 1024
-            && !request.password.chars().any(char::is_control),
-        "Password must have at least 12 characters, at most 1024 bytes, and no control characters"
-    );
-    ensure!(
-        LOCALES.contains(&request.locale.as_str()),
-        "Unsupported locale"
-    );
-    ensure!(
-        KEYBOARDS.contains(&request.keyboard.as_str()),
-        "Unsupported keyboard layout"
-    );
-    timezone::validate(&request.timezone, Path::new(&settings.zoneinfo))?;
-    ensure!(
-        !request.desktops.is_empty() && request.desktops.len() <= Desktop::ALL.len(),
-        "Select at least one desktop environment"
-    );
-    for (index, desktop) in request.desktops.iter().enumerate() {
-        ensure!(
-            !request.desktops[..index].contains(desktop),
-            "Duplicate desktop selection"
-        );
-    }
-    ensure!(
-        !(request.desktops.contains(&Desktop::Gnome)
-            && request.desktops.contains(&Desktop::Cinnamon)),
-        "GNOME and Cinnamon cannot currently be combined: their pinned NixOS modules conflict on GSettings overrides. Select one of those two; other desktops can be combined."
-    );
-    ensure!(
-        request.desktops.contains(&request.default_desktop),
-        "The default session must be a selected desktop"
-    );
-    ensure!(
-        request.copy_wifi || request.wifi_profiles.is_empty(),
-        "Wi-Fi transfer is disabled but profiles were supplied"
-    );
-    wifi::validate_profiles(&request.wifi_profiles, &request.username)?;
-    ensure!(
-        request.confirmation == format!("ERASE {}", request.disk.path),
-        "Type ERASE followed by the selected device path to confirm"
-    );
-    Ok(())
 }
 
 #[cfg(test)]

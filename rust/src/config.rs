@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! NixOS option semantics adapted from calamares-nixos-extensions 0.3.23.
 //! No Python/C++ module or global-storage hooks are executed by this installer.
-use crate::{Desktop, Firmware, Kernel, Request, Settings, read_trusted};
+use crate::{Desktop, Firmware, Hostname, InstallPlan, Kernel, Settings, read_trusted};
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeSet, fs, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
 
@@ -18,13 +18,13 @@ pub struct Template {
     pub lock: Vec<u8>,
 }
 impl Template {
-    pub fn load(settings: &Settings, hostname: &str) -> Result<Self> {
+    pub fn load(settings: &Settings, hostname: &Hostname) -> Result<Self> {
         let dir = Path::new(&settings.template_dir);
         let template = String::from_utf8(read_trusted(&dir.join("flake.nix.in"))?)?;
         let lock = read_trusted(&dir.join("flake.lock"))?;
         Self::parse(template, lock, hostname)
     }
-    pub fn parse(template: String, lock: Vec<u8>, hostname: &str) -> Result<Self> {
+    pub fn parse(template: String, lock: Vec<u8>, hostname: &Hostname) -> Result<Self> {
         ensure!(
             template.matches("@HOSTNAME@").count() == 1,
             "Template must contain exactly one hostname placeholder"
@@ -52,7 +52,7 @@ impl Template {
             );
         }
         Ok(Self {
-            flake: template.replace("@HOSTNAME@", &nix_string(hostname)),
+            flake: template.replace("@HOSTNAME@", &nix_string(hostname.as_str())),
             lock,
         })
     }
@@ -63,11 +63,12 @@ impl Template {
     }
 }
 
-pub fn configuration(request: &Request, settings: &Settings) -> String {
+pub fn configuration(request: &InstallPlan) -> String {
+    let settings = request.settings();
     let q = nix_string;
-    let boot = match request.firmware {
+    let boot = match request.firmware() {
         Firmware::Uefi => "boot.loader.systemd-boot.enable = true;\n  boot.loader.efi.canTouchEfiVariables = true;".into(),
-        Firmware::Bios => format!("boot.loader.grub.enable = true;\n  boot.loader.grub.device = {};\n  boot.loader.grub.useOSProber = false;", q(&request.disk.path)),
+        Firmware::Bios => format!("boot.loader.grub.enable = true;\n  boot.loader.grub.device = {};\n  boot.loader.grub.useOSProber = false;", q(&request.disk().path)),
     };
     let kernel = match settings.kernel {
         Kernel::Latest => "  boot.kernelPackages = pkgs.linuxPackages_latest;\n",
@@ -79,19 +80,20 @@ pub fn configuration(request: &Request, settings: &Settings) -> String {
         ""
     };
     let desktops = request
-        .desktops
+        .desktops()
+        .selected()
         .iter()
         .map(|desktop| format!("  {}.enable = true;\n", desktop.option()))
         .collect::<String>();
-    let default_session = q(request.default_desktop.session());
-    let display_manager = if request.desktops == [Desktop::Gnome] {
+    let default_session = q(request.desktops().default().session());
+    let display_manager = if request.desktops().selected() == [Desktop::Gnome] {
         "gdm"
     } else {
         "sddm"
     };
     // Multiple desktops set equally-prioritized defaults for these options.
     // Resolve the shared helpers explicitly, while portals remain per-session.
-    let helpers = if request.desktops.contains(&Desktop::Plasma) {
+    let helpers = if request.desktops().contains(Desktop::Plasma) {
         "  programs.ssh.askPassword = \"${pkgs.kdePackages.ksshaskpass}/bin/ksshaskpass\";\n  programs.gnupg.agent.pinentryPackage = pkgs.pinentry-qt;\n"
     } else {
         "  programs.ssh.askPassword = \"${pkgs.x11_ssh_askpass}/libexec/x11-ssh-askpass\";\n  programs.gnupg.agent.pinentryPackage = pkgs.pinentry-gnome3;\n"
@@ -128,13 +130,13 @@ pub fn configuration(request: &Request, settings: &Settings) -> String {
   system.stateVersion = {state};
 {diagnostic}}}
 "#,
-        hostname = q(&request.hostname),
-        timezone = q(&request.timezone),
-        locale = q(&request.locale),
-        keyboard = q(&request.keyboard),
-        username = q(&request.username),
-        full_name = q(&request.full_name),
-        unfree = request.allow_unfree,
+        hostname = q(request.hostname().as_str()),
+        timezone = q(request.timezone().as_str()),
+        locale = q(request.locale()),
+        keyboard = q(request.keyboard()),
+        username = q(request.username().as_str()),
+        full_name = q(request.full_name()),
+        unfree = request.allow_unfree(),
         state = q(&settings.state_version)
     )
 }
@@ -160,12 +162,13 @@ mod tests {
     }
     #[test]
     fn lock_and_placeholder_are_mandatory() {
-        assert!(Template::parse("no placeholder".into(), b"{}".to_vec(), "test").is_err());
+        let hostname = Hostname::parse("test").unwrap();
+        assert!(Template::parse("no placeholder".into(), b"{}".to_vec(), &hostname).is_err());
         assert!(
             Template::parse(
                 "@HOSTNAME@".into(),
                 br#"{"version":7,"root":"root","nodes":{"root":{"inputs":{}}}}"#.to_vec(),
-                "test"
+                &hostname
             )
             .is_err()
         );

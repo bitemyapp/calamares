@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use anyhow::{Result, ensure};
 use calamares_nixos::{
-    Request, disk,
-    install::{self, Event},
+    RawRequest, Settings, disk,
+    install::{self, Event, InstallMode},
 };
 use std::io::Read;
 use zeroize::Zeroizing;
@@ -15,9 +15,16 @@ fn run() -> Result<()> {
         let mut input = Zeroizing::new(Vec::new());
         std::io::stdin().take(1048577).read_to_end(&mut input)?;
         ensure!(input.len() <= 1048576, "Request too large");
-        let request: Request = serde_json::from_slice(&input)
+        let request: RawRequest = serde_json::from_slice(&input)
             .map_err(|_| anyhow::anyhow!("Invalid installation request"))?;
-        install::install(request, args == ["preflight"])?;
+        drop(input);
+        let confirmed = request.parse_confirmed(&Settings::load()?)?;
+        let mode = if args == ["preflight"] {
+            InstallMode::Preflight
+        } else {
+            InstallMode::Execute
+        };
+        install::install(confirmed, mode)?;
     } else {
         anyhow::bail!(
             "Usage: calamares-nixos-helper discover|preflight|install; installation requests are JSON on stdin"

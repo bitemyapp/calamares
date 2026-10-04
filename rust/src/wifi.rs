@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Read-only snapshot from the live user's NM session. Never log profile data.
+//! Read-only snapshots and parsed, normalized connection profiles. Never log secrets.
+use crate::Username;
 use anyhow::{Result, ensure};
 use std::{
+    collections::BTreeSet,
     fs,
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -12,56 +14,107 @@ use zeroize::Zeroizing;
 #[cfg(feature = "network")]
 mod nm;
 #[cfg(feature = "network")]
-pub use nm::snapshot;
+pub(crate) use nm::snapshot;
 
-pub fn validate_profiles(profiles: &[String], username: &str) -> Result<()> {
-    ensure!(
-        profiles.len() <= 32 && profiles.iter().all(|p| p.len() <= 16384),
-        "Too many or oversized Wi-Fi profiles"
-    );
-    let mut uuids = std::collections::BTreeSet::new();
-    for profile in profiles {
-        let normalized = normalize(profile, username)?;
-        let uuid = normalized
-            .lines()
-            .find_map(|line| line.strip_prefix("uuid="))
-            .ok_or_else(|| anyhow::anyhow!("Missing Wi-Fi profile identity"))?;
+// libnm's validated/normalized bytes are retained, not thrown away and parsed
+// again at write time. No Debug, Clone, Deserialize, or public raw-data accessor.
+struct WifiProfile {
+    uuid: String,
+    keyfile: Zeroizing<String>,
+}
+pub struct WifiProfiles(Vec<WifiProfile>);
+
+/// Opt-out cannot coexist with profiles. Copy may contain no saved connections.
+/// Only parsing can construct a bounded, duplicate-free WifiProfiles collection.
+/// ```compile_fail
+/// use calamares_nixos::wifi::WifiProfiles;
+/// let profiles = WifiProfiles(Vec::new());
+/// ```
+pub enum WifiTransfer {
+    Skip,
+    Copy(WifiProfiles),
+}
+impl WifiTransfer {
+    pub fn parse(enabled: bool, profiles: Vec<String>, username: &Username) -> Result<Self> {
+        let profiles = Zeroizing::new(profiles);
         ensure!(
-            uuids.insert(uuid.to_string()),
-            "Duplicate Wi-Fi profile identity"
+            enabled || profiles.is_empty(),
+            "Wi-Fi transfer is disabled but profiles were supplied"
         );
+        if !enabled {
+            return Ok(Self::Skip);
+        }
+        ensure!(
+            profiles.len() <= 32 && profiles.iter().all(|p| p.len() <= 16384),
+            "Too many or oversized Wi-Fi profiles"
+        );
+        let mut uuids = BTreeSet::new();
+        let mut parsed = Vec::with_capacity(profiles.len());
+        for profile in profiles.iter() {
+            let profile = parse_profile(profile, username)?;
+            ensure!(
+                uuids.insert(profile.uuid.clone()),
+                "Duplicate Wi-Fi profile identity"
+            );
+            parsed.push(profile);
+        }
+        Ok(Self::Copy(WifiProfiles(parsed)))
     }
-    Ok(())
+
+    pub fn enabled(&self) -> bool {
+        matches!(self, Self::Copy(_))
+    }
+    pub fn profile_count(&self) -> usize {
+        match self {
+            Self::Skip => 0,
+            Self::Copy(profiles) => profiles.0.len(),
+        }
+    }
+
+    /// Only I/O remains here: the profile bytes already carry parsing guarantees.
+    pub fn write_to(&self, root: &Path) -> Result<()> {
+        let Self::Copy(profiles) = self else {
+            return Ok(());
+        };
+        if profiles.0.is_empty() {
+            return Ok(());
+        }
+        let dir = root.join("etc/NetworkManager/system-connections");
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        for (index, profile) in profiles.0.iter().enumerate() {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(dir.join(format!("installer-wifi-{index}.nmconnection")))?;
+            file.write_all(profile.keyfile.as_bytes())?;
+            file.sync_all()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn into_raw(self) -> (bool, Vec<String>) {
+        match self {
+            Self::Skip => (false, vec![]),
+            Self::Copy(profiles) => (
+                true,
+                profiles
+                    .0
+                    .into_iter()
+                    .map(|mut p| std::mem::take(&mut *p.keyfile))
+                    .collect(),
+            ),
+        }
+    }
 }
 
 #[cfg(feature = "network")]
-fn normalize(profile: &str, username: &str) -> Result<Zeroizing<String>> {
-    nm::normalize(profile, username)
+fn parse_profile(profile: &str, username: &Username) -> Result<WifiProfile> {
+    nm::parse_profile(profile, username)
 }
 
 #[cfg(not(feature = "network"))]
-fn normalize(_: &str, _: &str) -> Result<Zeroizing<String>> {
+fn parse_profile(_: &str, _: &Username) -> Result<WifiProfile> {
     anyhow::bail!("Wi-Fi support was not compiled into this binary")
-}
-
-pub fn write_profiles(root: &Path, profiles: &[String], username: &str) -> Result<()> {
-    validate_profiles(profiles, username)?;
-    if profiles.is_empty() {
-        return Ok(());
-    }
-    let dir = root.join("etc/NetworkManager/system-connections");
-    fs::create_dir_all(&dir)?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-    for (index, profile) in profiles.iter().enumerate() {
-        let normalized = normalize(profile, username)?;
-        // Names are generated, never derived from an SSID or client path.
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(dir.join(format!("installer-wifi-{index}.nmconnection")))?;
-        file.write_all(normalized.as_bytes())?;
-        file.sync_all()?;
-    }
-    Ok(())
 }

@@ -19,8 +19,17 @@ pub fn validate_profiles(profiles: &[String], username: &str) -> Result<()> {
         profiles.len() <= 32 && profiles.iter().all(|p| p.len() <= 16384),
         "Too many or oversized Wi-Fi profiles"
     );
+    let mut uuids = std::collections::BTreeSet::new();
     for profile in profiles {
-        normalize(profile, username)?;
+        let normalized = normalize(profile, username)?;
+        let uuid = normalized
+            .lines()
+            .find_map(|line| line.strip_prefix("uuid="))
+            .ok_or_else(|| anyhow::anyhow!("Missing Wi-Fi profile identity"))?;
+        ensure!(
+            uuids.insert(uuid.to_string()),
+            "Duplicate Wi-Fi profile identity"
+        );
     }
     Ok(())
 }

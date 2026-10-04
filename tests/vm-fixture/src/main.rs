@@ -383,6 +383,18 @@ fn main() -> Result<()> {
                 "Secret inside flake source"
             );
             let configuration = fs::read_to_string("/etc/nixos/configuration.nix")?;
+            let selected = calamares_nixos::Desktop::ALL
+                .iter()
+                .find(|d| configuration.contains(&format!("defaultSession = \"{}\";", d.session())))
+                .context("No explicit default desktop")?;
+            println!("DESKTOP_SESSION={}", selected.session());
+            let enabled = calamares_nixos::Desktop::ALL
+                .iter()
+                .filter(|d| configuration.contains(&format!("{}.enable = true;", d.option())))
+                .map(|d| d.session())
+                .collect::<Vec<_>>()
+                .join(",");
+            println!("DESKTOPS={enabled}");
             ensure!(
                 output(
                     "timedatectl",

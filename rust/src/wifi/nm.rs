@@ -253,6 +253,16 @@ mod tests {
         assert!(!err.contains("Synthetic"));
     }
     #[test]
+    fn open_sae_and_duplicate_profiles() {
+        let open = WPA.replace(
+            "[wifi-security]\nkey-mgmt=wpa-psk\npsk=WiFi-Synthetic-Only-123!\npsk-flags=1\n",
+            "",
+        );
+        assert!(normalize(&open, "alice").is_ok());
+        assert!(normalize(&WPA.replace("wpa-psk", "sae"), "alice").is_ok());
+        assert!(super::super::validate_profiles(&[WPA.into(), WPA.into()], "alice").is_err());
+    }
+    #[test]
     fn target_files_are_private_and_outside_flake() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();

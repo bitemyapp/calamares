@@ -4,6 +4,21 @@ These results concern the NixOS-focused Rust implementation, not upstream
 Calamares's distribution/plugin feature set. The first-release scope and
 limitations are in [RUST-INSTALLER.md](RUST-INSTALLER.md).
 
+## Current desktop, Wi-Fi and time-zone work
+
+The current native package passes 21 tests (20 library tests and one GUI
+selection test), including desktop validation, NetworkManager keyfile/secret
+handling, private target files, and distinct Central/Eastern regional zones.
+Rustfmt and Clippy with warnings denied also pass. Full-image installation,
+desktop matrix, Wi-Fi persistence and CST/CDT results are tracked with the exact
+installer commit and ISO checksum in the graphical integration repository's
+[TESTING.md](https://github.com/bitemyapp/determinate-nixos-graphical/blob/codex/rust-calamares-integration/TESTING.md).
+That report, not the older component results below, identifies the latest tested
+image. A synthetic guest-only Wi-Fi profile tests persistence, not radio access.
+
+The remainder of this document preserves the original pre-integration results;
+its package hashes and test counts are historical, not current release claims.
+
 ## Build and local checks
 
 - Locked Nix build on Nixpkgs `c59305bab2065cfecc4944690d9eedbb56f3a9fa`.

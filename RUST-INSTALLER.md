@@ -96,7 +96,7 @@ reboot. The installer cannot promise rollback after a partition table is erased.
 ## Build and test
 
 ```
-cargo test --manifest-path rust/Cargo.toml --no-default-features
+cargo test --manifest-path rust/Cargo.toml --locked
 cargo clippy --manifest-path rust/Cargo.toml --all-targets --all-features -- -D warnings
 cargo fmt --manifest-path rust/Cargo.toml --check
 nix build --no-write-lock-file
@@ -137,7 +137,9 @@ alone does not verify every interactive widget path. The installed system boots
 without the ISO, and tests check its password hash, PAM authentication with wrong
 and correct passwords through a pseudo-terminal, locked root, desktop,
 Determinate services and absence of live-only installer configuration. This is
-not yet an interactive graphical desktop-login test.
+not itself an interactive graphical desktop-login test. The integrated ISO's
+supervised GUI tests and desktop-login evidence are recorded in the graphical
+repository's [verification report](https://github.com/bitemyapp/determinate-nixos-graphical/blob/codex/rust-calamares-integration/TESTING.md).
 
 Artifacts and disposable disks stay under ignored `artifacts/` and `.work/`.
 No host sudo, real block-device write, physical USB modification or host reboot

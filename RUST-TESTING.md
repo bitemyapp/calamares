@@ -9,7 +9,7 @@ limitations are in [RUST-INSTALLER.md](RUST-INSTALLER.md).
 - Locked Nix build on Nixpkgs `c59305bab2065cfecc4944690d9eedbb56f3a9fa`.
 - 12 backend unit tests and one GUI selection test pass in the Nix sandbox.
 - Rustfmt and Clippy with warnings denied, including the separate VM fixture.
-- Latest package: `/nix/store/091zgxadxyww1yvmzkj59611n7cwp0jn-calamares-nixos-rust-0.1.0`.
+- Pre-integration package: `/nix/store/091zgxadxyww1yvmzkj59611n7cwp0jn-calamares-nixos-rust-0.1.0`.
 
 ## Disposable-machine integration tests
 
@@ -42,6 +42,13 @@ The later graphical ISO integration must verify its own autostart and Polkit
 wiring; package-only testing cannot establish those properties.
 
 ## Development failures retained locally
+
+- The first integrated ISO exposed a trust-check mismatch: its settings link
+  into Nix's root-owned, sticky, group-writable store root. The helper now
+  accepts only that specific 1775 store-root case, still rejects writable
+  entries below it, and checks link ownership as well as resolved ownership.
+  An added regression test brings the native test total to 14. Final image
+  verification is recorded in the graphical installer repository.
 
 - A test fixture assumed `/etc/localtime` existed on the live ISO; it now uses
   trusted tzdata. Production media supplies an explicit immutable tzdata path.

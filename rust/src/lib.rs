@@ -82,6 +82,16 @@ pub const LOCALES: &[&str] = &[
 ];
 pub const KEYBOARDS: &[&str] = &["us", "gb", "de", "fr", "es", "it", "jp", "br"];
 
+fn trusted_component(path: &Path, uid: u32, mode: u32, directory: bool) -> bool {
+    // Nix's store root is root:nixbld 1775 on the live image. The sticky
+    // directory prevents builders from replacing root-owned store entries.
+    // Every referenced entry below it is still checked for root ownership
+    // and no group/other writes. Do not extend this exception to arbitrary
+    // shared directories or to a store without the sticky bit.
+    let store_root = path == Path::new("/nix/store") && directory && mode & 0o1777 == 0o1775;
+    uid == 0 && (mode & 0o022 == 0 || store_root)
+}
+
 pub fn read_trusted(path: &Path) -> Result<Vec<u8>> {
     // All parents, including symlink targets, must be owned by root and not
     // writable by another user. NixOS /etc links into /nix/store are expected.
@@ -89,7 +99,8 @@ pub fn read_trusted(path: &Path) -> Result<Vec<u8>> {
     for p in path.ancestors().chain(resolved.ancestors()) {
         let m = fs::metadata(p)?;
         ensure!(
-            m.uid() == 0 && m.mode() & 0o022 == 0,
+            fs::symlink_metadata(p)?.uid() == 0
+                && trusted_component(p, m.uid(), m.mode(), m.is_dir()),
             "Untrusted installer configuration: {}",
             p.display()
         );
@@ -197,4 +208,44 @@ pub fn validate(request: &Request, settings: &Settings) -> Result<()> {
         "Type ERASE followed by the selected device path to confirm"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    #[test]
+    fn sticky_nix_store_is_the_only_shared_directory_exception() {
+        assert!(trusted_component(Path::new("/nix/store"), 0, 0o41775, true));
+        assert!(trusted_component(
+            Path::new("/nix/store/root-owned-entry"),
+            0,
+            0o40755,
+            true
+        ));
+        assert!(!trusted_component(
+            Path::new("/nix/store"),
+            0,
+            0o40775,
+            true
+        ));
+        assert!(!trusted_component(
+            Path::new("/nix/store"),
+            1000,
+            0o41775,
+            true
+        ));
+        assert!(!trusted_component(
+            Path::new("/nix/store"),
+            0,
+            0o101775,
+            false
+        ));
+        assert!(!trusted_component(Path::new("/tmp"), 0, 0o41777, true));
+        assert!(!trusted_component(
+            Path::new("/nix/store/writable-entry"),
+            0,
+            0o40775,
+            true
+        ));
+    }
 }

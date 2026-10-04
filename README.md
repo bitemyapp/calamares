@@ -63,4 +63,12 @@ in Europe, but feel free to idle.
 Matrix is persistent, and we'll see your message eventually.
 
 * [![Join us on Matrix](https://img.shields.io/badge/Matrix-%23calamares:kde.org-blue)](https://matrix.to/#/#calamares:kde.org) (needs a Matrix account)
+# NixOS-focused Rust development branch
+
+This fork's active implementation is the native Rust/GTK4 NixOS installer in
+`rust/`, not the original multi-distribution Qt/C++ application below. Read
+[RUST-INSTALLER.md](RUST-INSTALLER.md) for supported scope, safeguards, build and
+verification instructions. Upstream source and notices are retained for history.
+
+---
 

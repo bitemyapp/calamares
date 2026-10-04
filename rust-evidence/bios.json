@@ -1,0 +1,9 @@
+{
+  "backend": "nix-package",
+  "firmware": "bios",
+  "iso_sha256": "3dd85d328e420af4c88c016b45dc9c4f69460c82b7d628218371b17110676447",
+  "package": "/nix/store/wcgx3laar7k88rw0nfh1rcqnxfa61v4p-calamares-nixos-rust-0.1.0",
+  "passed": true,
+  "run": "bios-1791075333637-50870",
+  "verification": "nix (Determinate Nix 3.23.0) 2.35.2\n\nfh 0.1.27\n\n2a1e300d41e32889d2f108a9405294cf89f0a196d755bfc4bf43b8eea9852d69  /etc/nixos/flake.lock\n\nPASS: installed system, password hash and PAM authentication, locked root, escaped configuration, desktop and Determinate services\n"
+}

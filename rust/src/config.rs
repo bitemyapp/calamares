@@ -105,6 +105,9 @@ pub fn configuration(request: &InstallPlan) -> String {
   {boot}
 {kernel}  networking.hostName = {hostname};
   networking.networkmanager.enable = true;
+  # Include redistributable device firmware even when additional unfree
+  # packages are declined. This is not a strictly free-software-only system.
+  hardware.enableRedistributableFirmware = true;
   time.timeZone = {timezone};
   i18n.defaultLocale = {locale};
   services.xserver.enable = true;

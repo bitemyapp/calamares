@@ -148,7 +148,7 @@ fn request() -> Result<RawRequest> {
         default_desktop: calamares_nixos::Desktop::Plasma,
         copy_wifi: true,
         wifi_profiles: vec![TEST_WIFI.into()],
-        allow_unfree: false,
+        allow_unfree: calamares_nixos::DEFAULT_ALLOW_UNFREE,
         confirmation: "ERASE /dev/vda".into(),
     })
 }
@@ -195,7 +195,7 @@ fn main() -> Result<()> {
                 desktops,
                 copy_wifi: false,
                 wifi_profiles: vec![],
-                allow_unfree: false,
+                allow_unfree: calamares_nixos::DEFAULT_ALLOW_UNFREE,
                 confirmation: "ERASE /dev/vda".into(),
             };
             let name = r
@@ -410,6 +410,31 @@ fn main() -> Result<()> {
                 "Secret inside flake source"
             );
             let configuration = fs::read_to_string("/etc/nixos/configuration.nix")?;
+            ensure!(
+                configuration.contains("hardware.enableRedistributableFirmware = true;"),
+                "Installed firmware policy missing"
+            );
+            ensure!(
+                configuration.contains("nixpkgs.config.allowUnfree = true;"),
+                "Installed hardware-friendly unfree default missing"
+            );
+            output(
+                "busctl",
+                &[
+                    "--system",
+                    "call",
+                    "org.freedesktop.DBus",
+                    "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus",
+                    "StartServiceByName",
+                    "su",
+                    "fi.w1.wpa_supplicant1",
+                    "0",
+                ],
+                30,
+            )?;
+            output("systemctl", &["is-active", "wpa_supplicant"], 15)?;
+            println!("HARDWARE_DEFAULTS=redistributable-firmware,unfree,wpa_supplicant");
             let selected = calamares_nixos::Desktop::ALL
                 .iter()
                 .find(|d| configuration.contains(&format!("defaultSession = \"{}\";", d.session())))

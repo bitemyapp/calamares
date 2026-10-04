@@ -18,7 +18,8 @@ The new implementation is GPL-3.0-or-later. It has no upstream endorsement.
   cannot be combined because the pinned NixOS modules conflict on GSettings.
 - Guided erase of one whole disk, GPT, ext4, EFI/systemd-boot or BIOS/GRUB.
 - Hostname, normal user with sudo, password, full name, time zone, a selection
-  of eight system locales and keyboard layouts, and optional unfree packages.
+  of eight system locales and keyboard layouts. Allowing unfree packages is
+  enabled by default, with an explicit checkbox opt-out and review summary.
 - Pinned Nixpkgs, Determinate Nix and `fh` inputs supplied by the installation
   media. The installed system keeps the same lock file.
 
@@ -30,6 +31,14 @@ guarantee for every physical machine. Do not erase irreplaceable data without a
 backup.
 
 ### Wi-Fi and time zone
+
+Every generated desktop configuration enables NetworkManager and redistributable
+device firmware. That firmware can be proprietary; unchecking the additional
+unfree-packages option does not promise a strictly free-software-only system.
+The unfree setting permits packages, not automatic selection of every vendor
+driver. NVIDIA/hybrid-GPU configuration remains hardware-specific. The upstream
+hardware generator still supplies detected storage, CPU microcode and device
+settings; the installer does not force NVIDIA or Broadcom drivers on all PCs.
 
 Wi-Fi transfer is enabled by default, with an opt-out and a profile count on
 the review page. The GUI worker queries NetworkManager as the live user, so

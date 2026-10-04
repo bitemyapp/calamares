@@ -251,7 +251,9 @@ pub fn build(app: &Application) {
     desktop_page.append(&label("Wi-Fi profiles are stored root-only, outside the Nix store. Keep the live wallet unlocked. Enterprise networks using certificate files or hardware tokens must be configured after installation."));
     let unfree =
         CheckButton::with_label("Allow unfree software (some hardware drivers require this)");
+    unfree.set_active(calamares_nixos::DEFAULT_ALLOW_UNFREE);
     desktop_page.append(&unfree);
+    desktop_page.append(&label("Enabled by default. Redistributable firmware is included either way. Allowing unfree packages does not automatically configure every vendor driver."));
     let next = Button::with_label("Review installation");
     next.add_css_class("suggested-action");
     let notebook = gtk::Notebook::new();

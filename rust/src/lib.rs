@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use std::{fs, os::unix::fs::MetadataExt, path::Path};
 
 pub const SETTINGS: &str = "/etc/calamares-nixos/settings.json";
+/// Hardware-friendly GUI default; the review page and request retain an opt-out.
+pub const DEFAULT_ALLOW_UNFREE: bool = true;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

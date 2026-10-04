@@ -116,7 +116,25 @@ fn single_desktop_configs_keep_selected_session() {
             assert!(!text.contains("services.desktopManager.plasma6.enable"));
         }
         assert!(text.contains("networking.networkmanager.enable = true;"));
+        assert!(text.contains("hardware.enableRedistributableFirmware = true;"));
+        assert!(!text.contains("networking.wireless.enable = false"));
     }
+}
+
+#[test]
+fn unfree_default_is_enabled_but_explicit_opt_out_survives() {
+    let (_dir, settings, mut raw) = fixture();
+    raw.allow_unfree = DEFAULT_ALLOW_UNFREE;
+    let text = config::configuration(&raw.parse(&settings).unwrap());
+    assert!(text.contains("nixpkgs.config.allowUnfree = true;"));
+    let (_dir, settings, mut raw) = fixture();
+    raw.allow_unfree = false;
+    let plan = raw.parse(&settings).unwrap();
+    let wire = plan.confirm("ERASE /dev/vda").unwrap().into_request();
+    let confirmed = wire.parse_confirmed(&settings).unwrap();
+    let text = config::configuration(&confirmed.into_plan());
+    assert!(text.contains("nixpkgs.config.allowUnfree = false;"));
+    assert!(text.contains("hardware.enableRedistributableFirmware = true;"));
 }
 
 #[test]

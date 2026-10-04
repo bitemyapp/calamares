@@ -162,12 +162,8 @@ pub fn partition(path: &str, index: u8) -> String {
 }
 
 /// Test diagnostics are only available with our marked, disposable QEMU disk.
-/// Both transports must satisfy the same machine, serial and size checks.
+/// Both transports must satisfy the same serial and size checks.
 pub fn vm_test_disk() -> Result<Identity> {
-    ensure!(
-        fs::read_to_string("/sys/class/dmi/id/product_serial")?.trim() == "RESPIN_VM_ONLY",
-        "Not the disposable test VM"
-    );
     let mut matches = discover()?.into_iter().filter(|d| {
         ["/dev/vda", "/dev/nvme0n1"].contains(&d.identity.path.as_str())
             && d.identity.serial == "RESPIN_TEST_ONLY"

@@ -282,6 +282,25 @@ fn hashing_authenticates_only_correct_password() {
 }
 
 #[test]
+fn installed_configuration_requires_uuid_identities_for_the_reviewed_firmware() {
+    let root = "11111111-2222-3333-4444-555555555555";
+    for filesystem in Filesystem::ALL {
+        for firmware in [Firmware::Uefi, Firmware::Bios] {
+            let (_dir, settings, mut raw) = fixture();
+            raw.filesystem = filesystem;
+            raw.firmware = firmware;
+            let plan = raw.parse(&settings).unwrap();
+            let boot = (firmware == Firmware::Uefi).then_some("A1B2-C3D4");
+            assert!(config::installed_configuration(&plan, root, boot).is_ok());
+            assert!(config::installed_configuration(&plan, "A1B2-C3D4", boot).is_err());
+            assert!(config::installed_configuration(&plan, root, Some(root)).is_err());
+            let mismatched_boot = (firmware == Firmware::Bios).then_some("A1B2-C3D4");
+            assert!(config::installed_configuration(&plan, root, mismatched_boot).is_err());
+        }
+    }
+}
+
+#[test]
 fn filesystem_choice_survives_review_confirmation_and_ipc() {
     for filesystem in Filesystem::ALL {
         let (_dir, settings, mut raw) = fixture();

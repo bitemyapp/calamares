@@ -180,7 +180,10 @@ fn seed_previous_filesystem(device: &str) -> Result<()> {
         300,
     )?;
     if uefi {
-        output("mkfs.fat", &["-F", "32", &disk::partition(device, 1)], 60)?;
+        // A stale, lexically earlier alias must never win over the new UUID.
+        let boot = disk::partition(device, 1);
+        output("mkfs.fat", &["-F", "32", "-i", "00000001", &boot], 60)?;
+        output("udevadm", &["trigger", "--action=change", &boot], 30)?;
     }
     output("udevadm", &["trigger", "--action=change", &root], 30)?;
     output("udevadm", &["settle", "--timeout=60"], 70)?;
@@ -255,7 +258,14 @@ fn main() -> Result<()> {
                 .map(|d| d.session())
                 .collect::<Vec<_>>()
                 .join("-");
-            configs.insert(name, config::configuration(&r.parse(&settings)?));
+            configs.insert(
+                name,
+                config::installed_configuration(
+                    &r.parse(&settings)?,
+                    "11111111-2222-3333-4444-555555555555",
+                    Some("A1B2-C3D4"),
+                )?,
+            );
         }
         println!("{}", serde_json::to_string_pretty(&configs)?);
         return Ok(());

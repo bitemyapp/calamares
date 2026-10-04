@@ -138,7 +138,6 @@ pub fn install(confirmed: ConfirmedInstall, mode: InstallMode) -> Result<()> {
     disk::revalidate(request.disk())?;
     request.filesystem().preflight(request.firmware())?;
     let template = Template::load(&settings, request.hostname())?;
-    let config = config::configuration(&request);
     progress(
         0,
         "Checking installation media, settings, target identity and pinned inputs",
@@ -189,7 +188,7 @@ pub fn install(confirmed: ConfirmedInstall, mode: InstallMode) -> Result<()> {
     let dev = request.disk().path.as_str();
     let target = Target::new()?;
     let mount = target.0.to_str().context("Target path encoding")?;
-    let storage = (|| -> Result<()> {
+    let storage = (|| -> Result<(String, Option<String>)> {
         progress(
             1,
             "Erasing the selected disk and creating a GPT partition table",
@@ -273,9 +272,15 @@ pub fn install(confirmed: ConfirmedInstall, mode: InstallMode) -> Result<()> {
             fs::create_dir(target.0.join("boot"))?;
             filesystem::mount_efi(&boot, target.0.join("boot").to_str().unwrap())?;
         }
-        Ok(())
+        let root_uuid = filesystem::probe_uuid(&root, request.filesystem().name())?;
+        let boot_uuid = if request.firmware() == Firmware::Uefi {
+            Some(filesystem::probe_uuid(&boot, "vfat")?)
+        } else {
+            None
+        };
+        Ok((root_uuid, boot_uuid))
     })();
-    storage.map_err(|error| filesystem::diagnose(error, dev))?;
+    let (root_uuid, boot_uuid) = storage.map_err(|error| filesystem::diagnose(error, dev))?;
     progress(
         3,
         "Generating hardware settings and the pinned Determinate flake",
@@ -286,7 +291,10 @@ pub fn install(confirmed: ConfirmedInstall, mode: InstallMode) -> Result<()> {
         dir.join("hardware-configuration.nix").is_file(),
         "Hardware configuration was not generated"
     );
-    fs::write(dir.join("configuration.nix"), config)?;
+    fs::write(
+        dir.join("configuration.nix"),
+        config::installed_configuration(&request, &root_uuid, boot_uuid.as_deref())?,
+    )?;
     template.write(&dir)?;
     // Do not put secrets inside the flake source: use a sibling under /etc.
     // configuration.nix uses this external absolute runtime path.

@@ -43,6 +43,12 @@ kernel's partition parent/number/geometry, wipes signatures inside the new
 partitions, and verifies each format with uncached `blkid --probe`. It releases
 the lock before triggering/waiting for udev, then mounts with an explicit type.
 This avoids relying on stale filesystem detection after overwriting a used disk.
+The helper also probes the new root and EFI filesystem UUIDs directly from their
+superblocks. It pins those device paths in `configuration.nix` with `lib.mkForce`:
+hardware detection can otherwise select an obsolete `/dev/disk/by-uuid` alias
+that still points to the reformatted partition. Waiting for udev alone does not
+prove that every old alias has disappeared. Missing, duplicate or malformed UUID
+probe data fails installation before the system build.
 Failures preserve bounded storage/kernel diagnostics in a root-only
 `/run/calamares-storage-*.log`; copy that file before rebooting. The GUI displays
 scrollable, selectable failure details.
@@ -50,7 +56,8 @@ scrollable, selectable failure details.
 `nix flake check` includes a separate Linux VM storage test. It runs the real
 format/probe/mount implementation against temporary loop images, covering all
 nine old/new filesystem pairs at both 512-byte and 4096-byte sector sizes,
-checking data after remount, and checking FAT32 ESP mounts. The test is ignored
+checking new UUIDs and data after remount, and checking FAT32 replacement and ESP
+mounts. The test is ignored
 in ordinary unprivileged Cargo runs; it must run explicitly inside disposable
 Linux infrastructure with loop/mount access:
 

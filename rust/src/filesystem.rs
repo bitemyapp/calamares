@@ -117,6 +117,56 @@ fn verify_with(
     );
     Ok(())
 }
+
+pub(crate) fn check_uuid(uuid: &str, kind: &str) -> Result<()> {
+    let (length, separators): (usize, &[usize]) = if kind == "vfat" {
+        (9, &[4])
+    } else {
+        (36, &[8, 13, 18, 23])
+    };
+    ensure!(
+        uuid.len() == length
+            && uuid.bytes().enumerate().all(|(index, byte)| {
+                if separators.contains(&index) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            }),
+        "Invalid {kind} filesystem UUID: {uuid:?}"
+    );
+    Ok(())
+}
+
+fn uuid_from_probe(probe: &str, expected: &str) -> Result<String> {
+    let field = |name: &str| -> Result<&str> {
+        let prefix = format!("{name}=");
+        let values = probe
+            .lines()
+            .filter_map(|line| line.strip_prefix(&prefix))
+            .collect::<Vec<_>>();
+        ensure!(
+            values.len() == 1,
+            "Missing or ambiguous {name} in filesystem probe"
+        );
+        Ok(values[0])
+    };
+    ensure!(
+        field("TYPE")? == expected,
+        "Filesystem type changed during UUID probing"
+    );
+    let uuid = field("UUID")?;
+    check_uuid(uuid, expected)?;
+    Ok(uuid.to_owned())
+}
+
+pub(crate) fn probe_uuid(device: &str, expected: &str) -> Result<String> {
+    // Old /dev/disk/by-uuid aliases can outlive a reformat even after udev
+    // settles. Read the superblock itself, never select an alias by its rdev.
+    let probe = output("blkid", &["--probe", "--output", "export", device], 30)?;
+    uuid_from_probe(&probe, expected)
+        .with_context(|| format!("Reading the new filesystem UUID on {device}"))
+}
 fn format_with(
     filesystem: Filesystem,
     device: &str,
@@ -220,6 +270,28 @@ pub(crate) fn diagnose(error: anyhow::Error, disk: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn filesystem_uuid_requires_one_matching_unambiguous_identity() {
+        let uuid = "11111111-2222-3333-4444-555555555555";
+        assert_eq!(
+            uuid_from_probe(&format!("TYPE=ext4\nUUID={uuid}\n"), "ext4").unwrap(),
+            uuid
+        );
+        assert_eq!(
+            uuid_from_probe("TYPE=vfat\nUUID=60F4-E5D4\n", "vfat").unwrap(),
+            "60F4-E5D4"
+        );
+        for probe in [
+            "TYPE=ext4\n",
+            "TYPE=vfat\nUUID=60F4-E5D4\n",
+            "TYPE=ext4\nUUID=\n",
+            "TYPE=ext4\nUUID=../../device\n",
+            "TYPE=ext4\nUUID=11111111-2222-3333-4444-555555555555\nUUID=11111111-2222-3333-4444-555555555555\n",
+            "TYPE=ext4\nTYPE=xfs\nUUID=11111111-2222-3333-4444-555555555555\n",
+        ] {
+            assert!(uuid_from_probe(probe, "ext4").is_err(), "{probe}");
+        }
+    }
     #[test]
     fn refuses_wrong_or_ambiguous_signatures_before_mounting() {
         for answer in [
@@ -397,9 +469,12 @@ mod tests {
             for previous in Filesystem::ALL {
                 for next in Filesystem::ALL {
                     previous.format(&image.device)?;
+                    let old_uuid = probe_uuid(&image.device, previous.name())?;
                     // Prime the ordinary userspace probe before replacing it.
                     output("blkid", &[&image.device], 30)?;
                     next.format(&image.device)?;
+                    let new_uuid = probe_uuid(&image.device, next.name())?;
+                    ensure!(new_uuid != old_uuid, "Reformat retained the previous UUID");
                     next.mount(&image.device, mount)?;
                     ensure!(
                         output(
@@ -432,6 +507,13 @@ mod tests {
                 }
             }
             format_efi(&image.device)?;
+            let old_uuid = probe_uuid(&image.device, "vfat")?;
+            output("blkid", &[&image.device], 30)?;
+            format_efi(&image.device)?;
+            ensure!(
+                probe_uuid(&image.device, "vfat")? != old_uuid,
+                "FAT reformat retained the previous UUID"
+            );
             mount_efi(&image.device, mount)?;
             ensure!(
                 output(

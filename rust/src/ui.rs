@@ -265,7 +265,9 @@ pub fn build(app: &Application) {
             .vexpand(true)
             .child(child)
             .build();
-        notebook.append_page(&scroll, Some(&label(name)));
+        // Notebook headers must keep their natural width. Wrapping body-text
+        // labels can shrink these tabs enough to clip their last line.
+        notebook.append_page(&scroll, Some(&Label::new(Some(name))));
     }
     let setup_page = GtkBox::new(Orientation::Vertical, 12);
     setup_page.append(&notebook);

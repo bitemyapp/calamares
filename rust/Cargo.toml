@@ -7,8 +7,9 @@ description = "NixOS-focused native Rust graphical installer"
 publish = false
 
 [features]
-default = ["gui"]
-gui = ["dep:gtk"]
+default = ["gui", "network"]
+gui = ["dep:gtk", "network"]
+network = ["dep:glib", "dep:gio"]
 
 [dependencies]
 anyhow = "=1.0.100"
@@ -19,6 +20,8 @@ sha-crypt = "=0.5.0"
 zeroize = { version = "=1.8.2", features = ["derive"] }
 tempfile = "=3.23.0"
 gtk = { package = "gtk4", version = "=0.10.3", optional = true }
+glib = { version = "=0.21.5", optional = true }
+gio = { version = "=0.21.5", optional = true }
 
 [[bin]]
 name = "calamares-nixos"

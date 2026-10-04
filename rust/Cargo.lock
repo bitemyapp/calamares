@@ -63,6 +63,8 @@ name = "calamares-nixos"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "gio",
+ "glib",
  "gtk4",
  "libc",
  "serde",

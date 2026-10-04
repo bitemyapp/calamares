@@ -12,6 +12,8 @@ use std::{
 };
 
 const PASSWORD: &str = "Qemu-Only-Test-123!";
+// Public synthetic network, no real wireless credentials or host NM access.
+const TEST_WIFI: &str = "[connection]\nid=Installer synthetic WiFi\nuuid=135ea3d9-d456-44b1-ae42-1e7081f66666\ntype=wifi\npermissions=user:nixos:;\n[wifi]\nssid=Installer synthetic WiFi\nmode=infrastructure\n[wifi-security]\nkey-mgmt=wpa-psk\npsk=WiFi-Synthetic-Only-123!\npsk-flags=0\n[ipv4]\nmethod=auto\n[ipv6]\nmethod=auto\n";
 fn invoke(request: Request, preflight: bool) -> Result<()> {
     let package = fs::read_to_string("/run/calamares-package-path")?;
     let helper = if std::env::var_os("CALAMARES_VM_DEV_BACKEND").is_some() {
@@ -121,11 +123,74 @@ fn request() -> Result<Request> {
         locale: "en_US.UTF-8".into(),
         timezone: "America/Chicago".into(),
         keyboard: "us".into(),
+        desktops: vec![
+            calamares_nixos::Desktop::Plasma,
+            calamares_nixos::Desktop::Xfce,
+        ],
+        default_desktop: calamares_nixos::Desktop::Plasma,
+        copy_wifi: true,
+        wifi_profiles: vec![TEST_WIFI.into()],
         allow_unfree: false,
         confirmation: "ERASE /dev/vda".into(),
     })
 }
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("desktop-configurations") {
+        // Non-destructive host-side generation for Nix module evaluation.
+        // Produces the actual backend output, never a second implementation.
+        use calamares_nixos::Desktop;
+        let settings = Settings {
+            template_dir: "/unused".into(),
+            zoneinfo: "/unused".into(),
+            state_version: "26.11".into(),
+            kernel: Kernel::Lts,
+            test_diagnostics: false,
+        };
+        let mut configs = std::collections::BTreeMap::new();
+        for bits in 1u8..64 {
+            let desktops: Vec<_> = Desktop::ALL
+                .iter()
+                .enumerate()
+                .filter_map(|(i, d)| (bits & (1 << i) != 0).then_some(*d))
+                .collect();
+            if desktops.contains(&Desktop::Gnome) && desktops.contains(&Desktop::Cinnamon) {
+                continue;
+            }
+            let r = Request {
+                disk: disk::Identity {
+                    path: "/dev/vda".into(),
+                    major_minor: "252:0".into(),
+                    bytes: 40 * 1024u64.pow(3),
+                    serial: "test".into(),
+                    wwn: "".into(),
+                    model: "test".into(),
+                },
+                firmware: Firmware::Uefi,
+                hostname: "desktop-test".into(),
+                username: "alice".into(),
+                full_name: "Test".into(),
+                password: "Public-Test-Only!".into(),
+                locale: "en_US.UTF-8".into(),
+                timezone: "America/Chicago".into(),
+                keyboard: "us".into(),
+                default_desktop: desktops[0],
+                desktops,
+                copy_wifi: false,
+                wifi_profiles: vec![],
+                allow_unfree: false,
+                confirmation: "ERASE /dev/vda".into(),
+            };
+            let name = r
+                .desktops
+                .iter()
+                .map(|d| d.session())
+                .collect::<Vec<_>>()
+                .join("-");
+            configs.insert(name, config::configuration(&r, &settings));
+        }
+        println!("{}", serde_json::to_string_pretty(&configs)?);
+        return Ok(());
+    }
     guard()?;
     match std::env::args().nth(1).as_deref() {
         Some("prepare-integrated") => {
@@ -158,7 +223,19 @@ fn main() -> Result<()> {
             file.write_all(&serde_json::to_vec(&settings)?)?;
             file.sync_all()?;
             fs::rename(pending, calamares_nixos::SETTINGS)?;
+            let wifi =
+                Path::new("/etc/NetworkManager/system-connections/installer-fixture.nmconnection");
+            let mut profile = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(wifi)?;
+            profile.write_all(TEST_WIFI.as_bytes())?;
+            profile.sync_all()?;
+            output("nmcli", &["connection", "load", wifi.to_str().unwrap()], 15)?;
+            output("timedatectl", &["set-timezone", "America/Chicago"], 15)?;
             println!("PASS: original media settings validated; VM diagnostics enabled");
+            println!("PASS: synthetic Wi-Fi profile seeded; live zone set to America/Chicago");
         }
         Some("prepare") => {
             ensure!(
@@ -306,6 +383,60 @@ fn main() -> Result<()> {
                 "Secret inside flake source"
             );
             let configuration = fs::read_to_string("/etc/nixos/configuration.nix")?;
+            ensure!(
+                output(
+                    "timedatectl",
+                    &["show", "--property=Timezone", "--value"],
+                    10
+                )?
+                .trim()
+                    == "America/Chicago",
+                "Installed time zone is not US Central"
+            );
+            let winter = output("date", &["--date=2026-01-15 12:00:00 UTC", "+%z %Z"], 10)?;
+            let summer = output("date", &["--date=2026-07-15 12:00:00 UTC", "+%z %Z"], 10)?;
+            ensure!(
+                winter.trim() == "-0600 CST" && summer.trim() == "-0500 CDT",
+                "Central daylight saving rules were not preserved"
+            );
+            let wifi =
+                Path::new("/etc/NetworkManager/system-connections/installer-wifi-0.nmconnection");
+            let metadata = fs::metadata(wifi)?;
+            ensure!(
+                metadata.uid() == 0 && metadata.permissions().mode() & 0o777 == 0o600,
+                "Wi-Fi profile not root-only"
+            );
+            let profile = fs::read_to_string(wifi)?;
+            ensure!(
+                profile.contains("psk=WiFi-Synthetic-Only-123!")
+                    && profile.contains("user:rusttest:;")
+                    && !profile.contains("user:nixos:"),
+                "Wi-Fi credentials or permissions not migrated"
+            );
+            ensure!(
+                !configuration.contains("WiFi-Synthetic")
+                    && !configuration.contains("Installer synthetic"),
+                "Wi-Fi leaked into generated flake"
+            );
+            let known = output(
+                "nmcli",
+                &[
+                    "-g",
+                    "connection.type",
+                    "connection",
+                    "show",
+                    "uuid",
+                    "135ea3d9-d456-44b1-ae42-1e7081f66666",
+                ],
+                15,
+            )?;
+            ensure!(
+                known.trim() == "802-11-wireless",
+                "Installed NetworkManager did not load transferred Wi-Fi"
+            );
+            println!(
+                "PASS: America/Chicago, winter CST/summer CDT; Wi-Fi credentials and user restrictions persisted root-only and loaded by NetworkManager"
+            );
             ensure!(
                 !configuration.contains(hash) && !configuration.contains(PASSWORD),
                 "Secret in configuration"

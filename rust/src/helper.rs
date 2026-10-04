@@ -13,8 +13,8 @@ fn run() -> Result<()> {
         println!("{}", serde_json::to_string(&disk::discover()?)?);
     } else if args == ["install"] || args == ["preflight"] {
         let mut input = Zeroizing::new(Vec::new());
-        std::io::stdin().take(16385).read_to_end(&mut input)?;
-        ensure!(input.len() <= 16384, "Request too large");
+        std::io::stdin().take(1048577).read_to_end(&mut input)?;
+        ensure!(input.len() <= 1048576, "Request too large");
         let request: Request = serde_json::from_slice(&input)
             .map_err(|_| anyhow::anyhow!("Invalid installation request"))?;
         install::install(request, args == ["preflight"])?;

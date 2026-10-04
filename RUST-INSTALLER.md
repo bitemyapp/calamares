@@ -12,7 +12,10 @@ The new implementation is GPL-3.0-or-later. It has no upstream endorsement.
 
 ## Supported first-release workflow
 
-- x86_64 NixOS live ISO, Plasma installed desktop, network connection required.
+- x86_64 NixOS live ISO; network connection required. The live desktop is Plasma.
+- Multi-select installed desktops: Plasma (default), GNOME, Xfce, Cinnamon,
+  MATE and LXQt, with an explicit default login session. GNOME and Cinnamon
+  cannot be combined because the pinned NixOS modules conflict on GSettings.
 - Guided erase of one whole disk, GPT, ext4, EFI/systemd-boot or BIOS/GRUB.
 - Hostname, normal user with sudo, password, full name, time zone, a selection
   of eight system locales and keyboard layouts, and optional unfree packages.
@@ -20,11 +23,37 @@ The new implementation is GPL-3.0-or-later. It has no upstream endorsement.
   media. The installed system keeps the same lock file.
 
 No manual partitioning, existing-OS preservation, encryption, RAID/LVM, Btrfs,
-offline installation, other desktop selection, upstream plugins or interface
+offline installation, upstream plugins or interface
 translations are implemented. The GUI says this before offering installation.
 Treat this as an experimental, NixOS-focused fork; VM verification is not a
 guarantee for every physical machine. Do not erase irreplaceable data without a
 backup.
+
+### Wi-Fi and time zone
+
+Wi-Fi transfer is enabled by default, with an opt-out and a profile count on
+the review page. The GUI worker queries NetworkManager as the live user, so
+its unlocked Secret Agent/wallet can supply saved passwords. The helper
+independently parses and validates the profiles with libnm before erasing.
+It writes root-owned mode-0600 keyfiles under
+`/etc/NetworkManager/system-connections`, never into the flake or Nix store.
+Live-user restrictions are remapped to the installed username; agent-owned
+credentials become system-keyfile secrets. Ethernet and VPN profiles are not
+copied. Live settings are never modified. Missing secrets or external EAP
+certificate/key references stop review rather than silently installing a
+broken connection: unlock/save the live connection or disable transfer and
+configure that enterprise network afterwards. No actual host Wi-Fi profiles
+are accessed by the tests; they use public synthetic credentials in guests.
+
+Time-zone detection prefers the live system's regional IANA zone. An unset/UTC
+live default triggers a bounded HTTPS request to `https://ipapi.co/timezone/`;
+the service sees the public IP address, not Wi-Fi data. Internet detection can
+be disabled. Its approximate result is identified as such (VPN/mobile routing
+can be wrong), and a user must review and confirm the zone. Manual edits win
+over late responses. Offline or invalid responses never silently guess a US
+zone. `America/Chicago` retains Central daylight-saving rules; no locale,
+country or numeric-offset-to-zone inference is used. Detection runs on a worker
+with its own progress indicator. Selecting a zone does not change the live OS.
 
 ## Architecture and safeguards
 
@@ -73,7 +102,7 @@ cargo fmt --manifest-path rust/Cargo.toml --check
 nix build --no-write-lock-file
 ```
 
-Local GUI builds need GTK4 development libraries. Nix supplies them. The Nix
+Local GUI builds need GTK4 and libnm development libraries. Nix supplies them. The Nix
 package includes the GUI, helper, desktop entry and Polkit policy; it deliberately
 does not contain the separate `tests/vm-fixture` crate.
 

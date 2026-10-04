@@ -272,6 +272,7 @@ pub fn install(mut request: Request, dry_run: bool) -> Result<()> {
     fs::create_dir(&secret_dir)?;
     fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700))?;
     config::write_secret(&secret_dir.join("user-password.hash"), &hash)?;
+    crate::wifi::write_profiles(&target.0, &request.wifi_profiles, &request.username)?;
     progress(
         4,
         "Building and installing NixOS (downloads can take a while)",

@@ -15,7 +15,8 @@ pkgs.rustPlatform.buildRustPackage {
     pkgs.pkg-config
     pkgs.wrapGAppsHook4
   ];
-  buildInputs = [ pkgs.gtk4 ];
+  buildInputs = [ pkgs.gtk4 pkgs.networkmanager ];
+  CALAMARES_CA_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
   # Privileged children use only this build-time path, never the invoking user's.
   CALAMARES_TOOL_PATH =
     pkgs.lib.makeBinPath [
@@ -25,6 +26,7 @@ pkgs.rustPlatform.buildRustPackage {
       pkgs.dosfstools
       pkgs.systemd
       pkgs.coreutils
+      pkgs.curl
     ]
     + ":/run/current-system/sw/bin";
   # NixOS installs the setuid entry point here; the store binary is not setuid.

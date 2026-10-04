@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 pub mod config;
+pub mod desktop;
 pub mod disk;
 pub mod install;
 pub mod process;
+pub mod timezone;
+pub mod wifi;
+pub use desktop::Desktop;
 #[cfg(test)]
 mod validation_tests;
 
@@ -61,12 +65,17 @@ pub struct Request {
     pub locale: String,
     pub timezone: String,
     pub keyboard: String,
+    pub desktops: Vec<Desktop>,
+    pub default_desktop: Desktop,
+    pub copy_wifi: bool,
+    pub wifi_profiles: Vec<String>,
     pub allow_unfree: bool,
     pub confirmation: String,
 }
 impl Drop for Request {
     fn drop(&mut self) {
         self.password.zeroize();
+        self.wifi_profiles.zeroize();
     }
 }
 
@@ -188,21 +197,31 @@ pub fn validate(request: &Request, settings: &Settings) -> Result<()> {
         KEYBOARDS.contains(&request.keyboard.as_str()),
         "Unsupported keyboard layout"
     );
+    timezone::validate(&request.timezone, Path::new(&settings.zoneinfo))?;
     ensure!(
-        request.timezone.len() <= 100
-            && request.timezone.split('/').all(|p| !p.is_empty()
-                && p != "."
-                && p != ".."
-                && p.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"_+-".contains(&b))),
-        "Invalid time zone"
+        !request.desktops.is_empty() && request.desktops.len() <= Desktop::ALL.len(),
+        "Select at least one desktop environment"
     );
-    let zone_root = Path::new(&settings.zoneinfo).canonicalize()?;
-    let zone = zone_root.join(&request.timezone).canonicalize()?;
+    for (index, desktop) in request.desktops.iter().enumerate() {
+        ensure!(
+            !request.desktops[..index].contains(desktop),
+            "Duplicate desktop selection"
+        );
+    }
     ensure!(
-        zone.starts_with(zone_root) && zone.is_file(),
-        "Unknown time zone"
+        !(request.desktops.contains(&Desktop::Gnome)
+            && request.desktops.contains(&Desktop::Cinnamon)),
+        "GNOME and Cinnamon cannot currently be combined: their pinned NixOS modules conflict on GSettings overrides. Select one of those two; other desktops can be combined."
     );
+    ensure!(
+        request.desktops.contains(&request.default_desktop),
+        "The default session must be a selected desktop"
+    );
+    ensure!(
+        request.copy_wifi || request.wifi_profiles.is_empty(),
+        "Wi-Fi transfer is disabled but profiles were supplied"
+    );
+    wifi::validate_profiles(&request.wifi_profiles, &request.username)?;
     ensure!(
         request.confirmation == format!("ERASE {}", request.disk.path),
         "Type ERASE followed by the selected device path to confirm"

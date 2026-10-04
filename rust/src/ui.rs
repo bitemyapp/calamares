@@ -2,9 +2,10 @@
 //! GTK owns widgets only. Filesystem discovery, validation, password hashing,
 //! authorization and installation all run on workers with bounded messages.
 use calamares_nixos::{
-    Firmware, KEYBOARDS, LOCALES, Request, Settings,
+    Desktop, Firmware, KEYBOARDS, LOCALES, Request, Settings,
     disk::{self, Disk},
     install::Event,
+    timezone, wifi,
 };
 use gtk::{
     Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, DropDown, Entry, Label,
@@ -26,6 +27,7 @@ enum Message {
     Reviewed(Result<Box<Request>, String>),
     Event(Event),
     Finished(Result<(), String>),
+    Zone(u64, Result<timezone::Detection, String>),
 }
 
 fn launch(request: Request, send: SyncSender<Message>) -> anyhow::Result<()> {
@@ -115,7 +117,7 @@ pub fn build(app: &Application) {
     title.add_css_class("title-1");
     outer.append(&title);
     outer.append(&label(
-        "Native Rust installer · Plasma desktop · pinned installation inputs",
+        "Native Rust installer · your choice of desktops · pinned installation inputs",
     ));
     let stack = Stack::new();
     stack.set_vexpand(true);
@@ -164,27 +166,106 @@ pub fn build(app: &Application) {
     row(&grid, 4, "Password (12+ characters)", &password);
     let repeat = PasswordEntry::builder().show_peek_icon(true).build();
     row(&grid, 5, "Repeat password", &repeat);
-    let locale = DropDown::from_strings(LOCALES);
-    row(&grid, 6, "System locale", &locale);
-    let timezone = entry("Etc/UTC");
-    timezone.set_max_length(100);
-    row(&grid, 7, "Time zone (e.g. America/Chicago)", &timezone);
-    let keyboard = DropDown::from_strings(KEYBOARDS);
-    row(&grid, 8, "Installed keyboard layout", &keyboard);
     setup.append(&grid);
-    setup.append(&label("The live keyboard layout is unchanged. Passwords are entered using the current live layout; confirm it before proceeding."));
+    let location_page = GtkBox::new(Orientation::Vertical, 12);
+    let location_grid = gtk::Grid::builder()
+        .row_spacing(12)
+        .column_spacing(18)
+        .build();
+    let locale = DropDown::from_strings(LOCALES);
+    row(&location_grid, 0, "System locale", &locale);
+    let timezone = entry("");
+    timezone.set_placeholder_text(Some("Detecting… or enter America/Chicago"));
+    timezone.set_max_length(100);
+    row(&location_grid, 1, "Time zone", &timezone);
+    let keyboard = DropDown::from_strings(KEYBOARDS);
+    row(&location_grid, 2, "Installed keyboard layout", &keyboard);
+    location_page.append(&location_grid);
+    let internet_zone = CheckButton::with_label(
+        "Use internet detection if the live time zone is unset (ipapi.co receives your public IP)",
+    );
+    internet_zone.set_active(true);
+    location_page.append(&internet_zone);
+    let detect = Button::with_label("Detect time zone again");
+    let zone_spinner = Spinner::new();
+    let detect_row = GtkBox::new(Orientation::Horizontal, 12);
+    detect_row.append(&detect);
+    detect_row.append(&zone_spinner);
+    location_page.append(&detect_row);
+    let zone_status = label("Checking the live system's time zone…");
+    location_page.append(&zone_status);
+    let zone_confirm =
+        CheckButton::with_label("I have checked that this time zone is correct for my location");
+    location_page.append(&zone_confirm);
+    location_page.append(&label("US Central is America/Chicago; US Eastern is America/New_York. Region-based zones handle daylight saving automatically. Locale and country alone cannot determine your zone."));
+    location_page.append(&label("The live keyboard layout is unchanged. Passwords are entered using the current live layout; confirm it before proceeding."));
+    let desktop_page = GtkBox::new(Orientation::Vertical, 12);
+    desktop_page.append(&label("Choose one or more desktop environments. All selected sessions will be available on the login screen; the live desktop stays Plasma."));
+    let desktops: Vec<_> = Desktop::ALL
+        .iter()
+        .map(|desktop| {
+            let check = CheckButton::with_label(desktop.label());
+            check.set_active(*desktop == Desktop::Plasma);
+            desktop_page.append(&check);
+            check
+        })
+        .collect();
+    let default_desktop = DropDown::from_strings(&Desktop::ALL.map(Desktop::label));
+    desktop_page.append(&label("GNOME and Cinnamon are alternatives: the pinned NixOS modules cannot currently enable both together."));
+    desktop_page.append(&label("Default login session"));
+    desktop_page.append(&default_desktop);
+    for (index, check) in desktops.iter().enumerate() {
+        check.connect_toggled({
+            let desktops = desktops.clone();
+            let default_desktop = default_desktop.clone();
+            move |check| {
+                if !check.is_active() && default_desktop.selected() == index as u32 {
+                    default_desktop.set_selected(
+                        desktops
+                            .iter()
+                            .position(CheckButton::is_active)
+                            .map(|n| n as u32)
+                            .unwrap_or(gtk::INVALID_LIST_POSITION),
+                    );
+                }
+            }
+        });
+    }
+    default_desktop.connect_selected_notify({
+        let desktops = desktops.clone();
+        move |menu| {
+            if let Some(check) = desktops.get(menu.selected() as usize) {
+                check.set_active(true);
+            }
+        }
+    });
+    let copy_wifi = CheckButton::with_label(
+        "Carry my saved live-session Wi-Fi connections and passwords into the installed system",
+    );
+    copy_wifi.set_active(true);
+    desktop_page.append(&copy_wifi);
+    desktop_page.append(&label("Wi-Fi profiles are stored root-only, outside the Nix store. Keep the live wallet unlocked. Enterprise networks using certificate files or hardware tokens must be configured after installation."));
     let unfree =
         CheckButton::with_label("Allow unfree software (some hardware drivers require this)");
-    setup.append(&unfree);
+    desktop_page.append(&unfree);
     let next = Button::with_label("Review installation");
     next.add_css_class("suggested-action");
-    let scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&setup)
-        .build();
+    let notebook = gtk::Notebook::new();
+    notebook.set_vexpand(true);
+    for (name, child) in [
+        ("System & account", &setup),
+        ("Desktops & Wi-Fi", &desktop_page),
+        ("Location", &location_page),
+    ] {
+        let scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(child)
+            .build();
+        notebook.append_page(&scroll, Some(&label(name)));
+    }
     let setup_page = GtkBox::new(Orientation::Vertical, 12);
-    setup_page.append(&scroll);
+    setup_page.append(&notebook);
     setup_page.append(&next);
     stack.add_named(&setup_page, Some("setup"));
 
@@ -210,7 +291,10 @@ pub fn build(app: &Application) {
     stack.add_named(&review, Some("review"));
 
     let progress_page = GtkBox::new(Orientation::Vertical, 18);
-    progress_page.append(&label("Installation in progress. Keep the computer connected to power and the network. Closing the installer is disabled until this operation finishes."));
+    let progress_heading = label(
+        "Installation in progress. Keep the computer connected to power and the network. Closing the installer is disabled until this operation finishes.",
+    );
+    progress_page.append(&progress_heading);
     let progress = ProgressBar::new();
     progress.set_show_text(true);
     progress_page.append(&progress);
@@ -222,6 +306,46 @@ pub fn build(app: &Application) {
     window.set_child(Some(&outer));
 
     let (send, receive) = mpsc::sync_channel::<Message>(64);
+    let zone_epoch = Rc::new(Cell::new(0u64));
+    timezone.connect_changed({
+        let epoch = zone_epoch.clone();
+        let confirm = zone_confirm.clone();
+        move |_| {
+            epoch.set(epoch.get().wrapping_add(1));
+            confirm.set_active(false);
+        }
+    });
+    let detect_zone: Rc<dyn Fn()> = Rc::new({
+        let send = send.clone();
+        let epoch = zone_epoch.clone();
+        let internet = internet_zone.clone();
+        let spinner = zone_spinner.clone();
+        let button = detect.clone();
+        let status = zone_status.clone();
+        move || {
+            epoch.set(epoch.get().wrapping_add(1));
+            let generation = epoch.get();
+            let internet = internet.is_active();
+            spinner.start();
+            button.set_sensitive(false);
+            status.set_text("Detecting time zone… you can still edit it manually.");
+            let send = send.clone();
+            thread::spawn(move || {
+                let result = Settings::load()
+                    .and_then(|s| timezone::detect(std::path::Path::new(&s.zoneinfo), internet))
+                    .map_err(|e| format!("{e:#}"));
+                let _ = send.send(Message::Zone(generation, result));
+            });
+        }
+    });
+    detect.connect_clicked({
+        let detect_zone = detect_zone.clone();
+        move |_| detect_zone()
+    });
+    internet_zone.connect_toggled({
+        let epoch = zone_epoch.clone();
+        move |_| epoch.set(epoch.get().wrapping_add(1))
+    });
     let disks = Rc::new(RefCell::new(Vec::<Disk>::new()));
     let firmware = Rc::new(Cell::new(Firmware::Bios));
     let pending = Rc::new(RefCell::new(None::<Request>));
@@ -269,6 +393,7 @@ pub fn build(app: &Application) {
         let password = password.clone();
         let repeat = repeat.clone();
         let setup_page = setup_page.clone();
+        let timezone = timezone.clone();
         move |_| {
             if busy.get() {
                 return;
@@ -286,6 +411,13 @@ pub fn build(app: &Application) {
                 status.set_text("The passwords do not match.");
                 return;
             }
+            if !zone_confirm.is_active() {
+                notebook.set_current_page(Some(2));
+                status.set_text(
+                    "Check the time zone on the Location tab and confirm it before continuing.",
+                );
+                return;
+            }
             let request = Request {
                 confirmation: format!("ERASE {}", disk.identity.path),
                 disk: disk.identity,
@@ -297,6 +429,17 @@ pub fn build(app: &Application) {
                 locale: choice(&locale, LOCALES),
                 timezone: timezone.text().into(),
                 keyboard: choice(&keyboard, KEYBOARDS),
+                desktops: Desktop::ALL
+                    .iter()
+                    .zip(&desktops)
+                    .filter_map(|(desktop, check)| check.is_active().then_some(*desktop))
+                    .collect(),
+                default_desktop: Desktop::ALL
+                    .get(default_desktop.selected() as usize)
+                    .copied()
+                    .unwrap_or(Desktop::Plasma),
+                copy_wifi: copy_wifi.is_active(),
+                wifi_profiles: vec![],
                 allow_unfree: unfree.is_active(),
             };
             busy.set(true);
@@ -308,9 +451,14 @@ pub fn build(app: &Application) {
             let send = send.clone();
             thread::spawn(move || {
                 let result = (|| -> anyhow::Result<Box<Request>> {
+                    let mut request = request;
                     let settings = Settings::load()?;
                     calamares_nixos::validate(&request, &settings)?;
                     disk::revalidate(&request.disk)?;
+                    if request.copy_wifi {
+                        request.wifi_profiles = wifi::snapshot()?;
+                    }
+                    calamares_nixos::validate(&request, &settings)?;
                     Ok(Box::new(request))
                 })()
                 .map_err(|e| format!("{e:#}"));
@@ -419,7 +567,13 @@ pub fn build(app: &Application) {
                         next.set_sensitive(true);
                         match result {
                             Ok(r) => {
-                                summary.set_text(&format!("ERASE ALL DATA ON {}\nModel: {}\nSerial: {}\nSize: {:.1} GiB\n\nInstall Plasma / {:?} / ext4\nHost: {} · User: {}\nLocale: {} · Time zone: {} · Keyboard: {}\nUnfree software: {}\n\nThe installation uses the media's pinned Determinate Nix flake. Root login is locked; your user can administer the system with sudo.\n\nType exactly: ERASE {}",r.disk.path,r.disk.model,r.disk.serial,r.disk.bytes as f64/1024f64.powi(3),r.firmware,r.hostname,r.username,r.locale,r.timezone,r.keyboard,r.allow_unfree,r.disk.path));
+                                let desktop_names = r
+                                    .desktops
+                                    .iter()
+                                    .map(|d| d.label())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                summary.set_text(&format!("ERASE ALL DATA ON {}\nModel: {} · Serial: {} · Size: {:.1} GiB\n\nDesktops: {}\nDefault session: {} · {:?} / ext4\nHost: {} · User: {}\nLocale: {} · Time zone: {} · Keyboard: {}\nWi-Fi transfer: {} · {} saved profiles\nUnfree software: {}\n\nThe installation uses the media's pinned Determinate Nix flake. Root login is locked; your user can administer the system with sudo.\n\nType exactly: ERASE {}",r.disk.path,r.disk.model,r.disk.serial,r.disk.bytes as f64/1024f64.powi(3),desktop_names,r.default_desktop.label(),r.firmware,r.hostname,r.username,r.locale,r.timezone,r.keyboard,r.copy_wifi,r.wifi_profiles.len(),r.allow_unfree,r.disk.path));
                                 *pending.borrow_mut() = Some(*r);
                                 erase.set_text("");
                                 consent.set_active(false);
@@ -449,7 +603,27 @@ pub fn build(app: &Application) {
                         installing.set(false);
                         spinner.stop();
                         done.set_visible(true);
+                        progress_heading.set_text(if result.is_ok() {
+                            "Installation complete."
+                        } else {
+                            "Installation did not complete. See the details below."
+                        });
                         match result {Ok(())=>status.set_text("Installation complete. Shut down the live system, remove the media and boot the installed disk."),Err(e)=>{if !status.text().starts_with("Installation failed:"){status.set_text(&e);}}}
+                    }
+                    Message::Zone(generation, result) => {
+                        zone_spinner.stop();
+                        detect.set_sensitive(true);
+                        if generation == zone_epoch.get() {
+                            match result {
+                                Ok(found) => {
+                                    timezone.set_text(&found.zone);
+                                    zone_status.set_text(&found.explanation);
+                                }
+                                Err(error) => zone_status.set_text(&error),
+                            }
+                        } else {
+                            zone_status.set_text("Your manual choice was kept; the detection result was not applied.");
+                        }
                     }
                 }
             }
@@ -458,6 +632,7 @@ pub fn build(app: &Application) {
     });
     window.present();
     rescan();
+    detect_zone();
 }
 
 #[cfg(test)]

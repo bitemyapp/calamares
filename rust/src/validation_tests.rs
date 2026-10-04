@@ -28,6 +28,10 @@ fn fixture() -> (tempfile::TempDir, Settings, Request) {
         locale: "en_US.UTF-8".into(),
         timezone: "Etc/UTC".into(),
         keyboard: "us".into(),
+        desktops: vec![Desktop::Plasma],
+        default_desktop: Desktop::Plasma,
+        copy_wifi: false,
+        wifi_profiles: vec![],
         allow_unfree: false,
         confirmation: "ERASE /dev/vda".into(),
     };
@@ -37,6 +41,45 @@ fn fixture() -> (tempfile::TempDir, Settings, Request) {
 fn valid_request() {
     let (_dir, s, r) = fixture();
     validate(&r, &s).unwrap();
+}
+#[test]
+fn desktop_selection_is_explicit_and_validated() {
+    let (_dir, s, mut r) = fixture();
+    for desktop in Desktop::ALL {
+        r.desktops = vec![desktop];
+        r.default_desktop = desktop;
+        validate(&r, &s).unwrap();
+        let text = config::configuration(&r, &s);
+        assert!(text.contains(&format!("{}.enable = true;", desktop.option())));
+        assert!(text.contains(&format!("defaultSession = \"{}\"", desktop.session())));
+        if desktop != Desktop::Plasma {
+            assert!(!text.contains("services.desktopManager.plasma6.enable"));
+        }
+    }
+    for desktops in [
+        vec![],
+        vec![Desktop::Plasma, Desktop::Plasma],
+        vec![Desktop::Gnome, Desktop::Cinnamon],
+    ] {
+        r.desktops = desktops;
+        assert!(validate(&r, &s).is_err());
+    }
+    r.desktops = vec![Desktop::Plasma, Desktop::Xfce];
+    r.default_desktop = Desktop::Xfce;
+    validate(&r, &s).unwrap();
+    r.default_desktop = Desktop::Gnome;
+    assert!(validate(&r, &s).is_err());
+}
+#[test]
+fn wifi_opt_out_rejects_injected_profiles() {
+    let (_dir, s, mut r) = fixture();
+    r.wifi_profiles.push("private data".into());
+    assert!(
+        validate(&r, &s)
+            .unwrap_err()
+            .to_string()
+            .contains("disabled")
+    );
 }
 #[test]
 fn reject_names_secrets_zone_and_confirmation() {

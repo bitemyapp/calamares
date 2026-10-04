@@ -310,6 +310,7 @@ pub fn build(app: &Application) {
 
     let (send, receive) = mpsc::sync_channel::<Message>(64);
     let zone_epoch = Rc::new(Cell::new(0u64));
+    let zone_running = Rc::new(Cell::new(false));
     timezone.connect_changed({
         let epoch = zone_epoch.clone();
         let confirm = zone_confirm.clone();
@@ -319,6 +320,7 @@ pub fn build(app: &Application) {
         }
     });
     let detect_zone: Rc<dyn Fn()> = Rc::new({
+        let running = zone_running.clone();
         let send = send.clone();
         let epoch = zone_epoch.clone();
         let internet = internet_zone.clone();
@@ -326,6 +328,7 @@ pub fn build(app: &Application) {
         let button = detect.clone();
         let status = zone_status.clone();
         move || {
+            running.set(true);
             epoch.set(epoch.get().wrapping_add(1));
             let generation = epoch.get();
             let internet = internet.is_active();
@@ -614,6 +617,7 @@ pub fn build(app: &Application) {
                         match result {Ok(())=>status.set_text("Installation complete. Shut down the live system, remove the media and boot the installed disk."),Err(e)=>{if !status.text().starts_with("Installation failed:"){status.set_text(&e);}}}
                     }
                     Message::Zone(generation, result) => {
+                        zone_running.set(false);
                         zone_spinner.stop();
                         detect.set_sensitive(true);
                         if generation == zone_epoch.get() {
@@ -629,6 +633,13 @@ pub fn build(app: &Application) {
                         }
                     }
                 }
+            }
+            // Keep a visible activity indicator even when Location is not the
+            // selected tab while its worker is still detecting the time zone.
+            if busy.get() || zone_running.get() {
+                spinner.start();
+            } else {
+                spinner.stop();
             }
             glib::ControlFlow::Continue
         }

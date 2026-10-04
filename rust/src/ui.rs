@@ -2,7 +2,8 @@
 //! GTK owns widgets only. Filesystem discovery, validation, password hashing,
 //! authorization and installation all run on workers with bounded messages.
 use calamares_nixos::{
-    ConfirmedInstall, Desktop, Firmware, InstallPlan, KEYBOARDS, LOCALES, RawRequest, Settings,
+    ConfirmedInstall, Desktop, Filesystem, Firmware, InstallPlan, KEYBOARDS, LOCALES, RawRequest,
+    Settings,
     disk::{self, Disk},
     install::Event,
     timezone,
@@ -137,7 +138,7 @@ pub fn build(app: &Application) {
 
     let setup = GtkBox::new(Orientation::Vertical, 14);
     let warning = label(
-        "This release supports erasing one whole disk: GPT + ext4, EFI or legacy BIOS. It does not support manual partitioning, encryption, preserving another OS, or offline installation. Back up your data before continuing.",
+        "This release supports erasing one whole disk: GPT with ext4, Btrfs or XFS, EFI or legacy BIOS. It does not support manual partitioning, encryption, preserving another OS, or offline installation. Back up your data before continuing.",
     );
     warning.add_css_class("warning");
     setup.append(&warning);
@@ -167,7 +168,10 @@ pub fn build(app: &Application) {
     row(&grid, 4, "Password (12+ characters)", &password);
     let repeat = PasswordEntry::builder().show_peek_icon(true).build();
     row(&grid, 5, "Repeat password", &repeat);
+    let filesystem = DropDown::from_strings(&Filesystem::ALL.map(Filesystem::label));
+    row(&grid, 6, "Root filesystem", &filesystem);
     setup.append(&grid);
+    setup.append(&label("Btrfs uses compression on a single root volume; automatic snapshots are not configured. The EFI boot partition uses FAT32."));
     let location_page = GtkBox::new(Orientation::Vertical, 12);
     let location_grid = gtk::Grid::builder()
         .row_spacing(12)
@@ -309,6 +313,17 @@ pub fn build(app: &Application) {
     let done = Button::with_label("Close installer");
     done.set_visible(false);
     progress_page.append(&done);
+    let failure_details = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .build();
+    let failure_scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .child(&failure_details)
+        .visible(false)
+        .build();
+    progress_page.append(&failure_scroll);
     stack.add_named(&progress_page, Some("progress"));
     stack.set_visible_child_name("setup");
     window.set_child(Some(&outer));
@@ -429,10 +444,17 @@ pub fn build(app: &Application) {
                 );
                 return;
             }
+            let Some(root_filesystem) =
+                Filesystem::ALL.get(filesystem.selected() as usize).copied()
+            else {
+                status.set_text("Select a root filesystem before continuing.");
+                return;
+            };
             let request = RawRequest {
                 confirmation: String::new(),
                 disk: disk.identity,
                 firmware: firmware.get(),
+                filesystem: root_filesystem,
                 hostname: hostname.text().into(),
                 username: username.text().into(),
                 full_name: full_name.text().into(),
@@ -602,7 +624,7 @@ pub fn build(app: &Application) {
                                     .map(|d| d.label())
                                     .collect::<Vec<_>>()
                                     .join(", ");
-                                summary.set_text(&format!("ERASE ALL DATA ON {}\nModel: {} · Serial: {} · Size: {:.1} GiB\n\nDesktops: {}\nDefault session: {} · {:?} / ext4\nHost: {} · User: {}\nLocale: {} · Time zone: {} · Keyboard: {}\nWi-Fi transfer: {} · {} saved profiles\nUnfree software: {}\n\nThe installation uses the media's pinned Determinate Nix flake. Root login is locked; your user can administer the system with sudo.\n\nType exactly: ERASE {}",r.disk().path,r.disk().model,r.disk().serial,r.disk().bytes as f64/1024f64.powi(3),desktop_names,r.desktops().default().label(),r.firmware(),r.hostname().as_str(),r.username().as_str(),r.locale(),r.timezone().as_str(),r.keyboard(),r.wifi().enabled(),r.wifi().profile_count(),r.allow_unfree(),r.disk().path));
+                                summary.set_text(&format!("ERASE ALL DATA ON {}\nModel: {} · Serial: {} · Size: {:.1} GiB\n\nDesktops: {}\nDefault session: {} · {:?} / {}\nHost: {} · User: {}\nLocale: {} · Time zone: {} · Keyboard: {}\nWi-Fi transfer: {} · {} saved profiles\nUnfree software: {}\n\nThe installation uses the media's pinned Determinate Nix flake. Root login is locked; your user can administer the system with sudo.\n\nType exactly: ERASE {}",r.disk().path,r.disk().model,r.disk().serial,r.disk().bytes as f64/1024f64.powi(3),desktop_names,r.desktops().default().label(),r.firmware(),r.filesystem().name(),r.hostname().as_str(),r.username().as_str(),r.locale(),r.timezone().as_str(),r.keyboard(),r.wifi().enabled(),r.wifi().profile_count(),r.allow_unfree(),r.disk().path));
                                 *pending.borrow_mut() = Some(*r);
                                 erase.set_text("");
                                 consent.set_active(false);
@@ -622,7 +644,9 @@ pub fn build(app: &Application) {
                     Message::Event(Event::Failed { message }) => {
                         // Bounded display work even if a command emits a large log.
                         let message: String = message.chars().take(6000).collect();
-                        status.set_text(&format!("Installation failed: {message}"));
+                        failure_details.buffer().set_text(&message);
+                        failure_scroll.set_visible(true);
+                        status.set_text("Installation failed. See the details above; the disk may have been modified.");
                     }
                     Message::Event(Event::Complete) => {
                         progress.set_fraction(1.0);
@@ -637,7 +661,7 @@ pub fn build(app: &Application) {
                         } else {
                             "Installation did not complete. See the details below."
                         });
-                        match result {Ok(())=>status.set_text("Installation complete. Shut down the live system, remove the media and boot the installed disk."),Err(e)=>{if !status.text().starts_with("Installation failed:"){status.set_text(&e);}}}
+                        match result {Ok(())=>status.set_text("Installation complete. Shut down the live system, remove the media and boot the installed disk."),Err(e)=>{if !status.text().starts_with("Installation failed."){status.set_text(&e);}}}
                     }
                     Message::Zone(generation, result) => {
                         zone_running.set(false);

@@ -22,6 +22,7 @@ fn fixture() -> (tempfile::TempDir, Settings, RawRequest) {
             model: "test".into(),
         },
         firmware: Firmware::Uefi,
+        filesystem: Filesystem::Ext4,
         hostname: "my-machine".into(),
         username: "alice".into(),
         full_name: "Alice ${literal}".into(),
@@ -86,8 +87,8 @@ fn every_desktop_subset_and_default_obeys_the_contract() {
             .enumerate()
             .filter_map(|(i, d)| (bits & (1 << i) != 0).then_some(*d))
             .collect();
-        let compatible = !selected.is_empty()
-            && !(selected.contains(&Desktop::Gnome) && selected.contains(&Desktop::Cinnamon));
+        let compatible = !(selected.is_empty()
+            || selected.contains(&Desktop::Gnome) && selected.contains(&Desktop::Cinnamon));
         supported += usize::from(compatible);
         for default in Desktop::ALL {
             let parsed = DesktopSelection::parse(selected.clone(), default);
@@ -278,4 +279,42 @@ fn hashing_authenticates_only_correct_password() {
     assert_ne!(a, b);
     sha_crypt::sha512_check("secret", &a).unwrap();
     assert!(sha_crypt::sha512_check("wrong", &a).is_err());
+}
+
+#[test]
+fn filesystem_choice_survives_review_confirmation_and_ipc() {
+    for filesystem in Filesystem::ALL {
+        let (_dir, settings, mut raw) = fixture();
+        raw.filesystem = filesystem;
+        let plan = raw.parse(&settings).unwrap();
+        assert_eq!(plan.filesystem(), filesystem);
+        assert_eq!(
+            config::configuration(&plan).contains("compress=zstd"),
+            filesystem == Filesystem::Btrfs
+        );
+        let wire = plan.confirm("ERASE /dev/vda").unwrap().into_request();
+        let received: RawRequest =
+            serde_json::from_slice(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        assert_eq!(
+            received
+                .parse_confirmed(&settings)
+                .unwrap()
+                .into_plan()
+                .filesystem(),
+            filesystem
+        );
+    }
+    let (_dir, _settings, raw) = fixture();
+    let mut value = serde_json::to_value(&raw).unwrap();
+    value.as_object_mut().unwrap().remove("filesystem");
+    assert_eq!(
+        serde_json::from_value::<RawRequest>(value.clone())
+            .unwrap()
+            .filesystem,
+        Filesystem::Ext4
+    );
+    for bad in ["ntfs", "auto", "ext4,xfs", "", "EXT4"] {
+        value["filesystem"] = bad.into();
+        assert!(serde_json::from_value::<RawRequest>(value.clone()).is_err());
+    }
 }

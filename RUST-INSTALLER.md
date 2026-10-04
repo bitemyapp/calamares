@@ -16,19 +16,52 @@ The new implementation is GPL-3.0-or-later. It has no upstream endorsement.
 - Multi-select installed desktops: Plasma (default), GNOME, Xfce, Cinnamon,
   MATE and LXQt, with an explicit default login session. GNOME and Cinnamon
   cannot be combined because the pinned NixOS modules conflict on GSettings.
-- Guided erase of one whole disk, GPT, ext4, EFI/systemd-boot or BIOS/GRUB.
+- Guided erase of one whole disk, GPT, ext4 (default), Btrfs or XFS, EFI/systemd-boot or BIOS/GRUB.
 - Hostname, normal user with sudo, password, full name, time zone, a selection
   of eight system locales and keyboard layouts. Allowing unfree packages is
   enabled by default, with an explicit checkbox opt-out and review summary.
 - Pinned Nixpkgs, Determinate Nix and `fh` inputs supplied by the installation
   media. The installed system keeps the same lock file.
 
-No manual partitioning, existing-OS preservation, encryption, RAID/LVM, Btrfs,
+No manual partitioning, existing-OS preservation, encryption, RAID/LVM,
 offline installation, upstream plugins or interface
 translations are implemented. The GUI says this before offering installation.
 Treat this as an experimental, NixOS-focused fork; VM verification is not a
 guarantee for every physical machine. Do not erase irreplaceable data without a
 backup.
+
+### Filesystems and storage verification
+
+The root filesystem is an explicit reviewed choice: ext4, Btrfs or XFS. Btrfs
+uses a single root volume with `compress=zstd`; automatic snapshots and a
+subvolume layout are not configured. UEFI always gets a separate FAT32 ESP.
+Older JSON requests default to ext4; unknown filesystem names are rejected.
+
+Before erasure the helper checks the selected formatter and live-kernel support.
+It holds the whole-device lock through partitioning and formatting, checks the
+kernel's partition parent/number/geometry, wipes signatures inside the new
+partitions, and verifies each format with uncached `blkid --probe`. It releases
+the lock before triggering/waiting for udev, then mounts with an explicit type.
+This avoids relying on stale filesystem detection after overwriting a used disk.
+Failures preserve bounded storage/kernel diagnostics in a root-only
+`/run/calamares-storage-*.log`; copy that file before rebooting. The GUI displays
+scrollable, selectable failure details.
+
+`nix flake check` includes a separate Linux VM storage test. It runs the real
+format/probe/mount implementation against temporary loop images, covering all
+nine old/new filesystem pairs at both 512-byte and 4096-byte sector sizes,
+checking data after remount, and checking FAT32 ESP mounts. The test is ignored
+in ordinary unprivileged Cargo runs; it must run explicitly inside disposable
+Linux infrastructure with loop/mount access:
+
+```sh
+cargo test --manifest-path rust/Cargo.toml --no-default-features --locked \
+  filesystem::tests::real_reformat_mount_matrix -- --ignored --nocapture
+```
+
+The companion ISO runner additionally tests actual NVMe and VirtIO controllers,
+used disks, firmware boot and the installed filesystem after reboot. Successful
+loop tests alone do not establish that a rebuilt ISO or a physical NVMe boots.
 
 ### Wi-Fi and time zone
 

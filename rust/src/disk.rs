@@ -9,6 +9,11 @@ use std::{
     path::Path,
 };
 
+#[allow(clippy::unnecessary_cast)] // dev_t is u64 on Linux, i32 on Darwin.
+fn device_number(meta: &fs::Metadata) -> libc::dev_t {
+    meta.rdev() as libc::dev_t
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Identity {
@@ -98,8 +103,8 @@ pub fn discover() -> Result<Vec<Disk>> {
             meta.file_type().is_block_device() && p.canonicalize()? == p,
             "Noncanonical block device"
         );
-        let major = libc::major(meta.rdev());
-        let minor = libc::minor(meta.rdev());
+        let major = libc::major(device_number(&meta));
+        let minor = libc::minor(device_number(&meta));
         ensure!(
             disk.identity.major_minor == format!("{major}:{minor}"),
             "Disk changed during discovery"
@@ -156,9 +161,111 @@ pub fn partition(path: &str, index: u8) -> String {
     )
 }
 
+/// Test diagnostics are only available with our marked, disposable QEMU disk.
+/// Both transports must satisfy the same machine, serial and size checks.
+pub fn vm_test_disk() -> Result<Identity> {
+    ensure!(
+        fs::read_to_string("/sys/class/dmi/id/product_serial")?.trim() == "RESPIN_VM_ONLY",
+        "Not the disposable test VM"
+    );
+    let mut matches = discover()?.into_iter().filter(|d| {
+        ["/dev/vda", "/dev/nvme0n1"].contains(&d.identity.path.as_str())
+            && d.identity.serial == "RESPIN_TEST_ONLY"
+            && d.identity.bytes == 40 * 1024u64.pow(3)
+    });
+    let disk = matches.next().context("Missing marked 40 GiB VM disk")?;
+    ensure!(matches.next().is_none(), "Multiple VM test disks");
+    Ok(disk.identity)
+}
+
+/// Require the kernel's actual partition geometry, not merely existing names.
+/// sysfs start/size are always in 512-byte sectors, including on 4Kn NVMe.
+pub(crate) fn verify_layout(disk: &Identity, firmware: crate::Firmware) -> Result<()> {
+    let parent = Path::new("/sys/dev/block")
+        .join(&disk.major_minor)
+        .canonicalize()?;
+    let root_start = if firmware == crate::Firmware::Uefi {
+        1025
+    } else {
+        3
+    } * 1024
+        * 1024;
+    for index in [1, 2] {
+        let device = partition(&disk.path, index);
+        let meta = fs::metadata(&device)?;
+        ensure!(
+            meta.file_type().is_block_device()
+                && Path::new(&device).canonicalize()? == Path::new(&device),
+            "Invalid partition node {device}"
+        );
+        let node = Path::new("/sys/dev/block")
+            .join(format!(
+                "{}:{}",
+                libc::major(device_number(&meta)),
+                libc::minor(device_number(&meta))
+            ))
+            .canonicalize()?;
+        ensure!(
+            node.parent() == Some(parent.as_path()),
+            "Partition {device} belongs to another disk"
+        );
+        let number = |name: &str| -> Result<u64> {
+            Ok(fs::read_to_string(node.join(name))?.trim().parse()?)
+        };
+        ensure!(
+            number("partition")? == u64::from(index),
+            "Wrong partition number for {device}"
+        );
+        let start = number("start")?
+            .checked_mul(512)
+            .context("Partition start overflow")?;
+        let size = number("size")?
+            .checked_mul(512)
+            .context("Partition size overflow")?;
+        ensure!(
+            layout_matches(index, start, size, root_start, disk.bytes),
+            "Unexpected partition geometry for {device}: start {start}, size {size}"
+        );
+    }
+    Ok(())
+}
+fn layout_matches(index: u8, start: u64, size: u64, root_start: u64, disk_bytes: u64) -> bool {
+    if index == 1 {
+        start == 1024 * 1024 && size == root_start - start
+    } else {
+        start == root_start
+            && size > 0
+            && start
+                .checked_add(size)
+                .is_some_and(|end| end <= disk_bytes && disk_bytes - end <= 2 * 1024 * 1024)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rejects_stale_partition_geometry() {
+        let bytes = 40 * 1024u64.pow(3);
+        let start = 1025 * 1024 * 1024;
+        assert!(layout_matches(1, 1024 * 1024, 1024u64.pow(3), start, bytes));
+        assert!(layout_matches(
+            2,
+            start,
+            bytes - start - 512 * 33,
+            start,
+            bytes
+        ));
+        assert!(!layout_matches(
+            2,
+            3 * 1024 * 1024,
+            bytes - start,
+            start,
+            bytes
+        ));
+        assert!(!layout_matches(2, start, bytes, start, bytes));
+        assert!(!layout_matches(2, start, 1024u64.pow(3), start, bytes));
+    }
     #[test]
     fn flat_device_list_is_rejected() {
         assert!(parse(r#"{"blockdevices":[{"type":"disk","size":42949672960,"ro":false,"path":"/dev/vda"},{"type":"part","mountpoints":["/"]}]}"#).is_err());

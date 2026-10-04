@@ -2,7 +2,7 @@
 use crate::{
     ConfirmedInstall, Firmware, Settings,
     config::{self, Template},
-    disk,
+    disk, filesystem,
     process::output,
 };
 use anyhow::{Context, Result, ensure};
@@ -13,7 +13,7 @@ use std::{
     fs,
     io::Write,
     os::{fd::AsRawFd, unix::fs::PermissionsExt},
-    path::{Path, PathBuf},
+    path::PathBuf,
     thread,
     time::{Duration, Instant},
 };
@@ -72,10 +72,7 @@ pub fn live_guard(settings: &Settings) -> Result<()> {
         "No read-only live ISO filesystem at /iso"
     );
     if settings.test_diagnostics {
-        ensure!(
-            fs::read_to_string("/sys/class/block/vda/serial")?.trim() == "RESPIN_TEST_ONLY",
-            "Test diagnostics require the disposable test disk"
-        );
+        disk::vm_test_disk()?;
     }
     Ok(())
 }
@@ -139,6 +136,7 @@ pub fn install(confirmed: ConfirmedInstall, mode: InstallMode) -> Result<()> {
         "Another installation is already running"
     );
     disk::revalidate(request.disk())?;
+    request.filesystem().preflight(request.firmware())?;
     let template = Template::load(&settings, request.hostname())?;
     let config = config::configuration(&request);
     progress(
@@ -189,76 +187,95 @@ pub fn install(confirmed: ConfirmedInstall, mode: InstallMode) -> Result<()> {
     );
     disk::revalidate(request.disk())?;
     let dev = request.disk().path.as_str();
-    progress(
-        1,
-        "Erasing the selected disk and creating a GPT partition table",
-    );
-    output("wipefs", &["--all", "--force", dev], 60)?;
-    output("parted", &["--script", dev, "mklabel", "gpt"], 60)?;
-    match request.firmware() {
-        Firmware::Uefi => {
-            output(
-                "parted",
-                &["--script", dev, "mkpart", "ESP", "fat32", "1MiB", "1025MiB"],
-                60,
-            )?;
-            output("parted", &["--script", dev, "set", "1", "esp", "on"], 60)?;
-        }
-        Firmware::Bios => {
-            output(
-                "parted",
-                &["--script", dev, "mkpart", "BIOS", "1MiB", "3MiB"],
-                60,
-            )?;
-            output(
-                "parted",
-                &["--script", dev, "set", "1", "bios_grub", "on"],
-                60,
-            )?;
-        }
-    }
-    let start = if request.firmware() == Firmware::Uefi {
-        "1025MiB"
-    } else {
-        "3MiB"
-    };
-    output(
-        "parted",
-        &["--script", dev, "mkpart", "root", "ext4", start, "100%"],
-        60,
-    )?;
-    // udev's probing also honors the block-device flock. Release it BEFORE
-    // waiting for the queue, otherwise our own partition events cannot finish.
-    // The installer-wide lock remains held through formatting and installation.
-    // Closing also emits IN_CLOSE_WRITE so udev reprobes the new table.
-    // https://systemd.io/BLOCK_DEVICE_LOCKING/
-    drop(device);
-    output("udevadm", &["settle", "--timeout=60"], 70)?;
-    let root = disk::partition(dev, 2);
-    let boot = disk::partition(dev, 1);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !Path::new(&root).exists() || !Path::new(&boot).exists() {
-        ensure!(Instant::now() < deadline, "Partitions did not appear");
-        thread::sleep(Duration::from_millis(200));
-    }
-    progress(2, "Formatting and mounting the new filesystems");
-    output("mkfs.ext4", &["-F", &root], 300)?;
     let target = Target::new()?;
     let mount = target.0.to_str().context("Target path encoding")?;
-    output("mount", &[&root, mount], 30)?;
-    target.1.set(true);
-    if request.firmware() == Firmware::Uefi {
-        output("mkfs.fat", &["-F", "32", &boot], 60)?;
-        fs::create_dir(target.0.join("boot"))?;
+    let storage = (|| -> Result<()> {
+        progress(
+            1,
+            "Erasing the selected disk and creating a GPT partition table",
+        );
+        output("wipefs", &["--all", "--force", dev], 60)?;
+        output("parted", &["--script", dev, "mklabel", "gpt"], 60)?;
+        match request.firmware() {
+            Firmware::Uefi => {
+                output(
+                    "parted",
+                    &["--script", dev, "mkpart", "ESP", "fat32", "1MiB", "1025MiB"],
+                    60,
+                )?;
+                output("parted", &["--script", dev, "set", "1", "esp", "on"], 60)?;
+            }
+            Firmware::Bios => {
+                output(
+                    "parted",
+                    &["--script", dev, "mkpart", "BIOS", "1MiB", "3MiB"],
+                    60,
+                )?;
+                output(
+                    "parted",
+                    &["--script", dev, "set", "1", "bios_grub", "on"],
+                    60,
+                )?;
+            }
+        }
+        let start = if request.firmware() == Firmware::Uefi {
+            "1025MiB"
+        } else {
+            "3MiB"
+        };
         output(
-            "mount",
-            &[&boot, target.0.join("boot").to_str().unwrap()],
-            30,
+            "parted",
+            &[
+                "--script",
+                dev,
+                "mkpart",
+                "root",
+                request.filesystem().name(),
+                start,
+                "100%",
+            ],
+            60,
         )?;
-    }
-    // Let UUID symlinks for the freshly formatted filesystems appear before
-    // nixos-generate-config chooses persistent device references.
-    output("udevadm", &["settle", "--timeout=60"], 70)?;
+        // Keep udev from observing partially written superblocks. Partition nodes
+        // come from the kernel/devtmpfs; do not wait for udev while holding its lock.
+        output("blockdev", &["--rereadpt", dev], 30)?;
+        let root = disk::partition(dev, 2);
+        let boot = disk::partition(dev, 1);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match disk::verify_layout(request.disk(), request.firmware()) {
+                Ok(()) => break,
+                Err(error) if Instant::now() >= deadline => {
+                    return Err(error.context("Kernel partition layout did not become ready"));
+                }
+                Err(_) => thread::sleep(Duration::from_millis(200)),
+            }
+        }
+        disk::revalidate(request.disk())?;
+        progress(2, "Formatting, verifying and mounting the new filesystems");
+        request.filesystem().format(&root)?;
+        if request.firmware() == Firmware::Uefi {
+            filesystem::format_efi(&boot)?;
+        } else {
+            // A BIOS boot partition must not retain an old filesystem signature.
+            output("wipefs", &["--all", "--force", &boot], 60)?;
+        }
+        device.sync_all()?;
+        drop(device);
+        // A fresh explicit change event updates UUID/type information, including
+        // events skipped while locked. Never rely on pre-format udev/blkid caches.
+        output("udevadm", &["trigger", "--action=change", &root, &boot], 30)?;
+        output("udevadm", &["settle", "--timeout=60"], 70)?;
+        disk::revalidate(request.disk())?;
+        request.filesystem().mount(&root, mount)?;
+        target.1.set(true);
+        if request.firmware() == Firmware::Uefi {
+            fs::create_dir(target.0.join("boot"))?;
+            filesystem::mount_efi(&boot, target.0.join("boot").to_str().unwrap())?;
+        }
+        Ok(())
+    })();
+    storage.map_err(|error| filesystem::diagnose(error, dev))?;
     progress(
         3,
         "Generating hardware settings and the pinned Determinate flake",

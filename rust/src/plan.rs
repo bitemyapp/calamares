@@ -3,20 +3,22 @@
 //! Plans are immutable and deliberately neither Deserialize nor Debug/Clone.
 //! They describe reviewed intent, not a promise that a disk is still safe.
 use crate::{
-    Firmware, KEYBOARDS, LOCALES, Settings, desktop::DesktopSelection, disk, timezone::TimeZone,
-    wifi::WifiTransfer,
+    Filesystem, Firmware, KEYBOARDS, LOCALES, Settings, desktop::DesktopSelection, disk,
+    timezone::TimeZone, wifi::WifiTransfer,
 };
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use zeroize::{Zeroize, Zeroizing};
 
-/// Untrusted form/wire data. The JSON protocol is unchanged.
+/// Untrusted form/wire data. Older requests default to ext4.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawRequest {
     pub disk: disk::Identity,
     pub firmware: Firmware,
+    #[serde(default)]
+    pub filesystem: Filesystem,
     pub hostname: String,
     pub username: String,
     pub full_name: String,
@@ -119,6 +121,7 @@ pub struct InstallPlan {
     settings: Settings,
     disk: disk::Identity,
     firmware: Firmware,
+    filesystem: Filesystem,
     hostname: Hostname,
     username: Username,
     full_name: String,
@@ -173,6 +176,7 @@ impl RawRequest {
             settings: settings.clone(),
             disk: self.disk.clone(),
             firmware: self.firmware,
+            filesystem: self.filesystem,
             hostname,
             username,
             full_name: std::mem::take(&mut self.full_name),
@@ -202,6 +206,9 @@ impl InstallPlan {
     }
     pub fn firmware(&self) -> Firmware {
         self.firmware
+    }
+    pub fn filesystem(&self) -> Filesystem {
+        self.filesystem
     }
     pub fn hostname(&self) -> &Hostname {
         &self.hostname
@@ -279,6 +286,7 @@ impl ConfirmedInstall {
             confirmation: format!("ERASE {}", plan.disk.path),
             disk: plan.disk,
             firmware: plan.firmware,
+            filesystem: plan.filesystem,
             hostname: plan.hostname.0,
             username: plan.username.0,
             full_name: plan.full_name,

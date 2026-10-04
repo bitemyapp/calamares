@@ -9,7 +9,10 @@
     in
     {
       packages.${system}.default = import ./nix/package.nix { inherit pkgs; };
-      checks.${system}.installer = self.packages.${system}.default;
+      checks.${system} = {
+        installer = self.packages.${system}.default;
+        storage = import ./nix/storage-test.nix { inherit pkgs; };
+      };
       formatter.${system} = pkgs.nixfmt;
     };
 }

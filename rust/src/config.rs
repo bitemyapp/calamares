@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! NixOS option semantics adapted from calamares-nixos-extensions 0.3.23.
 //! No Python/C++ module or global-storage hooks are executed by this installer.
-use crate::{Desktop, Firmware, Hostname, InstallPlan, Kernel, Settings, read_trusted};
+use crate::{Desktop, Filesystem, Firmware, Hostname, InstallPlan, Kernel, Settings, read_trusted};
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeSet, fs, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
 
@@ -74,6 +74,12 @@ pub fn configuration(request: &InstallPlan) -> String {
         Kernel::Latest => "  boot.kernelPackages = pkgs.linuxPackages_latest;\n",
         Kernel::Lts => "",
     };
+    // Upstream hardware detection preserves Btrfs subvolumes, but not compression.
+    let filesystem_options = if request.filesystem() == Filesystem::Btrfs {
+        "  fileSystems.\"/\".options = [ \"compress=zstd\" ];\n"
+    } else {
+        ""
+    };
     let diagnostic = if settings.test_diagnostics {
         "  # Disposable QEMU verification only.\n  services.qemuGuest.enable = true;\n  boot.kernelParams = [ \"console=ttyS0,115200n8\" \"console=tty0\" ];\n"
     } else {
@@ -103,7 +109,7 @@ pub fn configuration(request: &InstallPlan) -> String {
 {{ config, pkgs, ... }}: {{
   imports = [ ./hardware-configuration.nix ];
   {boot}
-{kernel}  networking.hostName = {hostname};
+{kernel}{filesystem_options}  networking.hostName = {hostname};
   networking.networkmanager.enable = true;
   # Include redistributable device firmware even when additional unfree
   # packages are declined. This is not a strictly free-software-only system.

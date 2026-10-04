@@ -26,7 +26,10 @@ pkgs.rustPlatform.buildRustPackage {
       pkgs.util-linux
       pkgs.parted
       pkgs.e2fsprogs
+      pkgs.btrfs-progs
+      pkgs.xfsprogs
       pkgs.dosfstools
+      pkgs.kmod
       pkgs.systemd
       pkgs.coreutils
       pkgs.curl
@@ -35,6 +38,7 @@ pkgs.rustPlatform.buildRustPackage {
   # NixOS installs the setuid entry point here; the store binary is not setuid.
   CALAMARES_PKEXEC = "/run/wrappers/bin/pkexec";
   doCheck = true;
+  passthru.storageTest = import ./storage-test.nix { inherit pkgs; };
   postInstall = ''
     mkdir -p $out/share/applications $out/share/polkit-1/actions
     cp ${./calamares-nixos.desktop} $out/share/applications/org.calamares.NixOSRust.desktop

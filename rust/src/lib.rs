@@ -2,9 +2,11 @@
 pub mod config;
 pub mod desktop;
 pub mod disk;
+pub mod filesystem;
 pub mod install;
 pub mod plan;
 pub mod process;
+pub use filesystem::Filesystem;
 pub use plan::{ConfirmedInstall, Hostname, InstallPlan, RawRequest, Username};
 pub mod timezone;
 pub mod wifi;

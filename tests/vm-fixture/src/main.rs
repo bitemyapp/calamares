@@ -3,7 +3,7 @@
 //! Fixed public test credentials, only inside serial/size/live-root guarded VMs.
 use anyhow::{Context, Result, ensure};
 use calamares_nixos::{
-    Firmware, Hostname, Kernel, RawRequest, Settings, config, disk, process::output,
+    Filesystem, Firmware, Hostname, Kernel, RawRequest, Settings, config, disk, process::output,
 };
 use std::{
     fs,
@@ -116,24 +116,19 @@ fn pam_authenticate(password: &str) -> Result<bool> {
 }
 fn guard() -> Result<()> {
     ensure!(unsafe { libc::geteuid() } == 0, "VM fixture requires root");
-    ensure!(
-        fs::read_to_string("/sys/class/block/vda/serial")?.trim() == "RESPIN_TEST_ONLY",
-        "Not the disposable test VM"
-    );
-    ensure!(
-        output("blockdev", &["--getsize64", "/dev/vda"], 10)?.trim() == "42949672960",
-        "Not a 40 GiB virtual disk"
-    );
+    disk::vm_test_disk()?;
     Ok(())
+}
+fn selected_filesystem() -> Result<Filesystem> {
+    Ok(serde_json::from_value(serde_json::Value::String(
+        std::env::var("CALAMARES_TEST_FILESYSTEM").unwrap_or_else(|_| "ext4".into()),
+    ))?)
 }
 fn request() -> Result<RawRequest> {
     Ok(RawRequest {
-        disk: disk::discover()?
-            .into_iter()
-            .find(|d| d.identity.path == "/dev/vda")
-            .unwrap()
-            .identity,
+        disk: disk::vm_test_disk()?,
         firmware: Firmware::current(),
+        filesystem: selected_filesystem()?,
         hostname: "rust-test".into(),
         username: "rusttest".into(),
         full_name: "Rust ${literal} Test".into(),
@@ -149,9 +144,64 @@ fn request() -> Result<RawRequest> {
         copy_wifi: true,
         wifi_profiles: vec![TEST_WIFI.into()],
         allow_unfree: calamares_nixos::DEFAULT_ALLOW_UNFREE,
-        confirmation: "ERASE /dev/vda".into(),
+        confirmation: format!("ERASE {}", disk::vm_test_disk()?.path),
     })
 }
+fn seed_previous_filesystem(device: &str) -> Result<()> {
+    let previous =
+        std::env::var("CALAMARES_TEST_PREVIOUS_FILESYSTEM").unwrap_or_else(|_| "blank".into());
+    if previous == "blank" {
+        return Ok(());
+    }
+    let filesystem: Filesystem = serde_json::from_value(serde_json::Value::String(previous))?;
+    let uefi = Firmware::current() == Firmware::Uefi;
+    let start = if uefi { "1025MiB" } else { "3MiB" };
+    output(
+        "parted",
+        &[
+            "--script", device, "mklabel", "gpt", "mkpart", "old-boot", "1MiB", start, "mkpart",
+            "old-root", start, "100%",
+        ],
+        60,
+    )?;
+    output("udevadm", &["settle", "--timeout=60"], 70)?;
+    let root = disk::partition(device, 2);
+    let program = format!("mkfs.{}", filesystem.name());
+    output(
+        &program,
+        &[
+            if filesystem == Filesystem::Ext4 {
+                "-F"
+            } else {
+                "-f"
+            },
+            &root,
+        ],
+        300,
+    )?;
+    if uefi {
+        output("mkfs.fat", &["-F", "32", &disk::partition(device, 1)], 60)?;
+    }
+    output("udevadm", &["trigger", "--action=change", &root], 30)?;
+    output("udevadm", &["settle", "--timeout=60"], 70)?;
+    ensure!(
+        output(
+            "blkid",
+            &["--probe", "--output", "value", "--match-tag", "TYPE", &root],
+            30
+        )?
+        .trim()
+            == filesystem.name(),
+        "Could not seed previous filesystem"
+    );
+    println!("SEEDED_PREVIOUS_FILESYSTEM={}", filesystem.name());
+    println!(
+        "{}",
+        output("udevadm", &["info", "--query=property", &root], 15)?
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("desktop-configurations") {
         // Non-destructive host-side generation for Nix module evaluation.
@@ -184,6 +234,7 @@ fn main() -> Result<()> {
                     model: "test".into(),
                 },
                 firmware: Firmware::Uefi,
+                filesystem: Filesystem::Ext4,
                 hostname: "desktop-test".into(),
                 username: "alice".into(),
                 full_name: "Test".into(),
@@ -210,6 +261,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     guard()?;
+    let test_disk = disk::vm_test_disk()?.path;
     match std::env::args().nth(1).as_deref() {
         Some("prepare-integrated") => {
             ensure!(
@@ -302,7 +354,7 @@ fn main() -> Result<()> {
                 "Not live media"
             );
             ensure!(
-                output("blkid", &["-p", "/dev/vda"], 10).is_err(),
+                output("blkid", &["-p", &test_disk], 10).is_err(),
                 "Refusing an initialized test disk"
             );
             let before = output("sha256sum", &["/etc/calamares-nixos/flake.lock"], 10)?;
@@ -317,7 +369,7 @@ fn main() -> Result<()> {
                 }
                 ensure!(invoke(bad, false).is_err(), "Accepted invalid {invalid}");
                 ensure!(
-                    output("blkid", &["-p", "/dev/vda"], 10).is_err(),
+                    output("blkid", &["-p", &test_disk], 10).is_err(),
                     "Negative {invalid} test wrote to disk"
                 );
             }
@@ -328,14 +380,15 @@ fn main() -> Result<()> {
                 "Accepted mismatched erase confirmation"
             );
             ensure!(
-                output("blkid", &["-p", "/dev/vda"], 10).is_err(),
+                output("blkid", &["-p", &test_disk], 10).is_err(),
                 "Negative test wrote to disk"
             );
             invoke(request()?, true)?;
             ensure!(
-                output("blkid", &["-p", "/dev/vda"], 10).is_err(),
+                output("blkid", &["-p", &test_disk], 10).is_err(),
                 "Preflight wrote to disk"
             );
+            seed_previous_filesystem(&test_disk)?;
             invoke(request()?, false)?;
             ensure!(
                 before == output("sha256sum", &["/etc/calamares-nixos/flake.lock"], 10)?,
@@ -344,9 +397,27 @@ fn main() -> Result<()> {
         }
         Some("verify") => {
             ensure!(
-                output("findmnt", &["-n", "-o", "FSTYPE", "/"], 10)?.trim() == "ext4",
-                "Not installed root"
+                output("findmnt", &["-n", "-o", "FSTYPE", "/"], 10)?.trim()
+                    == selected_filesystem()?.name(),
+                "Installed root filesystem differs from the requested choice"
             );
+            println!("ROOT_FILESYSTEM={}", selected_filesystem()?.name());
+            let hardware = fs::read_to_string("/etc/nixos/hardware-configuration.nix")?;
+            ensure!(
+                hardware.contains(&format!("fsType = \"{}\"", selected_filesystem()?.name())),
+                "Generated hardware configuration lost the root filesystem"
+            );
+            ensure!(
+                hardware.contains("/dev/disk/by-uuid/"),
+                "Hardware configuration lacks persistent UUIDs"
+            );
+            if selected_filesystem()? == Filesystem::Btrfs {
+                ensure!(
+                    output("findmnt", &["-n", "-o", "OPTIONS", "--mountpoint", "/"], 10)?
+                        .contains("compress=zstd"),
+                    "Btrfs compression did not survive reboot"
+                );
+            }
             ensure!(
                 output("hostname", &[], 10)?.trim() == "rust-test",
                 "Wrong hostname"

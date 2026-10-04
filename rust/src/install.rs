@@ -136,6 +136,7 @@ pub fn install(confirmed: ConfirmedInstall, mode: InstallMode) -> Result<()> {
         "Another installation is already running"
     );
     disk::revalidate(request.disk())?;
+    progress(0, "Checking filesystem support before erasing the disk");
     request.filesystem().preflight(request.firmware())?;
     let template = Template::load(&settings, request.hostname())?;
     progress(

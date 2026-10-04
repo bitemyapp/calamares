@@ -68,10 +68,19 @@ fn preflight_with(
 ) -> Result<()> {
     run(filesystem.formatter(), &[if filesystem == Filesystem::Btrfs { "--version" } else { "-V" }], 15)
         .context("The installation media is missing a working filesystem formatter; no disk writes were made")?;
-    run("modprobe", &[filesystem.name()], 15)?;
+    // Cold module loading can include decompression and kernel relocation while
+    // the live desktop is starting. This is read-only preparation, not a disk job.
+    run("modprobe", &[filesystem.name()], 120).with_context(|| {
+        format!(
+            "Could not load {} kernel support; no disk writes were made",
+            filesystem.name()
+        )
+    })?;
     if firmware == Firmware::Uefi {
-        run("mkfs.fat", &["--help"], 15)?;
-        run("modprobe", &["vfat"], 15)?;
+        run("mkfs.fat", &["--help"], 15)
+            .context("Could not check the EFI formatter; no disk writes were made")?;
+        run("modprobe", &["vfat"], 120)
+            .context("Could not load FAT32 kernel support; no disk writes were made")?;
     }
     let supported = read_filesystems()?;
     for name in [
@@ -399,6 +408,31 @@ mod tests {
             .is_err()
         );
         assert_eq!(calls, 1);
+    }
+    #[test]
+    fn module_load_failures_report_that_the_disk_is_untouched() {
+        for failed_module in ["xfs", "vfat"] {
+            let error = preflight_with(
+                Filesystem::Xfs,
+                Firmware::Uefi,
+                |program, args, _| {
+                    if program == "modprobe" && args == [failed_module] {
+                        anyhow::bail!("modprobe timed out");
+                    }
+                    Ok(String::new())
+                },
+                || panic!("must stop after the failed module load"),
+            )
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("no disk writes were made"));
+            assert!(message.contains("modprobe timed out"));
+            assert!(message.contains(if failed_module == "xfs" {
+                "xfs"
+            } else {
+                "FAT32"
+            }));
+        }
     }
     /// Run only inside a disposable Linux VM/container with loop and mount access.
     /// Every write is confined to a loop device backed by our newly created file.

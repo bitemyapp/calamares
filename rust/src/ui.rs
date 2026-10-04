@@ -219,6 +219,9 @@ pub fn build(app: &Application) {
             let desktops = desktops.clone();
             let default_desktop = default_desktop.clone();
             move |check| {
+                if check.is_active() && default_desktop.selected() == gtk::INVALID_LIST_POSITION {
+                    default_desktop.set_selected(index as u32);
+                }
                 if !check.is_active() && default_desktop.selected() == index as u32 {
                     default_desktop.set_selected(
                         desktops

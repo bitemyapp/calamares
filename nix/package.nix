@@ -15,7 +15,10 @@ pkgs.rustPlatform.buildRustPackage {
     pkgs.pkg-config
     pkgs.wrapGAppsHook4
   ];
-  buildInputs = [ pkgs.gtk4 pkgs.networkmanager ];
+  buildInputs = [
+    pkgs.gtk4
+    pkgs.networkmanager
+  ];
   CALAMARES_CA_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
   # Privileged children use only this build-time path, never the invoking user's.
   CALAMARES_TOOL_PATH =

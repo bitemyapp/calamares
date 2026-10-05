@@ -93,7 +93,7 @@ impl Desktop {
                 "Dynamic tiling Wayland compositor with its upstream default configuration."
             }
             Self::Omarchy => {
-                "Keyboard-driven Hyprland in the style of Omarchy: Waybar, Walker, Mako and themes."
+                "Keyboard-driven Hyprland in the style of Omarchy 4: its Tokyo Night look, menus and key bindings."
             }
         }
     }

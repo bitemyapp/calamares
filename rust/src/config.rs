@@ -2,7 +2,8 @@
 //! NixOS option semantics adapted from calamares-nixos-extensions 0.3.23.
 //! No Python/C++ module or global-storage hooks are executed by this installer.
 use crate::{
-    Firmware, Hostname, InstallPlan, Kernel, Settings, filesystem::Identities, read_trusted,
+    Firmware, Hostname, InstallPlan, Kernel, Settings, filesystem::Identities, graphics::Offload,
+    read_trusted,
 };
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeSet, fs, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
@@ -135,6 +136,29 @@ pub fn configuration(request: &InstallPlan, ids: &Identities) -> Result<String> 
         }
         None => storage.push_str("  swapDevices = lib.mkForce [ ];\n"),
     }
+    let graphics = match (&request.graphics().nvidia, request.allow_unfree()) {
+        (Some(nvidia), true) => {
+            let mut text = String::from(
+                "  # NVIDIA's driver (latest release, open kernel modules) instead of nouveau.\n  calamares.nvidia.enable = true;\n",
+            );
+            if let Some(offload) = &request.graphics().offload {
+                let (key, id) = match offload {
+                    Offload::Intel(id) => ("intelBusId", id),
+                    Offload::Amd(id) => ("amdgpuBusId", id),
+                };
+                text.push_str(&format!(
+                    "  # Laptop: the integrated GPU drives the panel; run programs on the NVIDIA GPU with nvidia-offload.\n  calamares.nvidia.prime = {{ nvidiaBusId = {}; {key} = {}; }};\n",
+                    q(nvidia),
+                    q(id)
+                ));
+            }
+            text
+        }
+        (Some(_), false) => {
+            "  # An NVIDIA GPU was found, but its driver needs unfree packages, which were declined.\n".into()
+        }
+        (None, _) => String::new(),
+    };
     let diagnostic = if settings.test_diagnostics {
         "  # Disposable QEMU verification only.\n  services.qemuGuest.enable = true;\n  boot.kernelParams = [ \"console=ttyS0,115200n8\" \"console=tty0\" ];\n"
     } else {
@@ -153,7 +177,7 @@ pub fn configuration(request: &InstallPlan, ids: &Identities) -> Result<String> 
   # CachyOS-inspired kernel, memory, I/O and service defaults (rust/system/tuning.nix in the calamares input).
   calamares.tuning.enable = {tuning};
   {boot}
-{kernel}{storage}  networking.hostName = {hostname};
+{kernel}{storage}{graphics}  networking.hostName = {hostname};
   networking.networkmanager.enable = true;
   # Include redistributable device firmware even when additional unfree
   # packages are declined. This is not a strictly free-software-only system.
@@ -275,6 +299,7 @@ mod tests {
             allow_unfree: true,
             swap: true,
             tuning: true,
+            graphics: Default::default(),
             confirmation: String::new(),
         }
         .parse(&settings)

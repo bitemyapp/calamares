@@ -89,10 +89,22 @@ loop tests alone do not establish that a rebuilt ISO or a physical NVMe boots.
 Every generated desktop configuration enables NetworkManager and redistributable
 device firmware. That firmware can be proprietary; unchecking the additional
 unfree-packages option does not promise a strictly free-software-only system.
-The unfree setting permits packages, not automatic selection of every vendor
-driver. NVIDIA/hybrid-GPU configuration remains hardware-specific. The upstream
-hardware generator still supplies detected storage, CPU microcode and device
-settings; the installer does not force NVIDIA or Broadcom drivers on all PCs.
+The upstream hardware generator still supplies detected storage, CPU microcode
+and device settings.
+
+NVIDIA GPUs use NVIDIA's own driver rather than nouveau (`rust/system/nvidia.nix`,
+`src/graphics.rs`). The GUI reads display controllers from sysfs and sends the
+first NVIDIA GPU's bus ID with the request; the helper accepts only well-formed
+bus IDs. On laptops (SMBIOS chassis types 8, 9, 10, 14, 31 and 32) with an
+Intel or AMD integrated GPU, the configuration adds PRIME offload: the
+integrated GPU drives the panel, `nvidia-offload` runs a program on the NVIDIA
+GPU, and fine-grained power management turns it off when idle. The driver is
+the latest release with open kernel modules, which support Turing and newer
+GPUs, the only ones the latest driver supports. Video memory is preserved
+across suspend and hibernation. The review page shows the choice. If unfree
+packages are declined, nouveau remains. The installation media carry the same
+driver build, so an installation copies it instead of downloading NVIDIA's
+installer and building it.
 
 Wi-Fi transfer is enabled by default, with an opt-out and a profile count on
 the review page. The GUI worker queries NetworkManager as the live user, so

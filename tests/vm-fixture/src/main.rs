@@ -227,6 +227,7 @@ fn request() -> Result<RawRequest> {
         allow_unfree: calamares_nixos::DEFAULT_ALLOW_UNFREE,
         swap: flag("CALAMARES_TEST_SWAP"),
         tuning: flag("CALAMARES_TEST_TUNING"),
+        graphics: Default::default(),
         confirmation: format!("ERASE {}", disk::vm_test_disk()?.path),
     })
 }
@@ -382,6 +383,7 @@ fn main() -> Result<()> {
                 allow_unfree,
                 swap: true,
                 tuning: true,
+                graphics: Default::default(),
                 confirmation: "ERASE /dev/vda".into(),
             };
             configs.insert(

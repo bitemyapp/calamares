@@ -218,6 +218,7 @@ pub(crate) struct Review {
     unfree: bool,
     swap: bool,
     tuning: bool,
+    graphics: String,
 }
 impl Review {
     fn of(plan: &InstallPlan) -> Self {
@@ -239,6 +240,7 @@ impl Review {
             unfree: plan.allow_unfree(),
             swap: plan.swap(),
             tuning: plan.tuning(),
+            graphics: plan.graphics().describe(plan.allow_unfree()),
         }
     }
 }
@@ -1439,6 +1441,7 @@ impl Ui {
             allow_unfree: self.desktop.unfree.is_active(),
             swap: self.disk.swap.is_active(),
             tuning: self.disk.tuning.is_active(),
+            graphics: calamares_nixos::graphics::Graphics::detect(),
         };
         self.stop_warm();
         self.reviewing.set(true);
@@ -1547,6 +1550,7 @@ impl Ui {
         } else {
             "Not allowed (redistributable firmware is still included)"
         });
+        r.graphics.set_subtitle(&review.graphics);
         r.wifi.set_subtitle(&if review.wifi {
             match review.wifi_profiles {
                 1 => "1 saved network will be copied".to_string(),

@@ -8,6 +8,7 @@
 {
   imports = [
     ./desktops.nix
+    ./nvidia.nix
     ./tuning.nix
   ];
 }

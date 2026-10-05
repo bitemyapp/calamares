@@ -4,6 +4,7 @@ pub mod config;
 pub mod desktop;
 pub mod disk;
 pub mod filesystem;
+pub mod graphics;
 pub mod install;
 pub mod memory;
 pub mod nixlog;

@@ -92,6 +92,7 @@ pub(super) struct ReviewPage {
     pub(super) applications: adw::ActionRow,
     pub(super) tuning: adw::ActionRow,
     pub(super) unfree: adw::ActionRow,
+    pub(super) graphics: adw::ActionRow,
     pub(super) wifi: adw::ActionRow,
     pub(super) computer: adw::ActionRow,
     pub(super) user: adw::ActionRow,
@@ -672,8 +673,17 @@ pub(super) fn build_review_page() -> ReviewPage {
     let applications = property("Applications");
     let tuning = property("Performance tuning");
     let unfree = property("Unfree software");
+    let graphics = property("Graphics driver");
     let wifi = property("Wi-Fi networks");
-    for row in [&desktops, &session, &applications, &tuning, &unfree, &wifi] {
+    for row in [
+        &desktops,
+        &session,
+        &applications,
+        &tuning,
+        &unfree,
+        &graphics,
+        &wifi,
+    ] {
         system_group.add(row);
     }
     page.add(&system_group);
@@ -706,6 +716,7 @@ pub(super) fn build_review_page() -> ReviewPage {
         applications,
         tuning,
         unfree,
+        graphics,
         wifi,
         computer,
         user,

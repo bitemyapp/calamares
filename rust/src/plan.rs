@@ -39,6 +39,9 @@ pub struct RawRequest {
     /// CachyOS-inspired kernel, memory, I/O and service defaults.
     #[serde(default = "crate::enabled")]
     pub tuning: bool,
+    /// NVIDIA GPUs the GUI found, for NVIDIA's driver and PRIME offload.
+    #[serde(default)]
+    pub graphics: crate::graphics::Graphics,
     pub confirmation: String,
 }
 impl Drop for RawRequest {
@@ -143,6 +146,7 @@ pub struct InstallPlan {
     allow_unfree: bool,
     swap: bool,
     tuning: bool,
+    graphics: crate::graphics::Graphics,
 }
 
 impl RawRequest {
@@ -187,6 +191,7 @@ impl RawRequest {
             std::mem::take(&mut self.wifi_profiles),
             &username,
         )?;
+        self.graphics.check()?;
         Ok(InstallPlan {
             settings: settings.clone(),
             disk: self.disk.clone(),
@@ -205,6 +210,7 @@ impl RawRequest {
             allow_unfree: self.allow_unfree,
             swap: self.swap,
             tuning: self.tuning,
+            graphics: std::mem::take(&mut self.graphics),
         })
     }
 
@@ -263,6 +269,9 @@ impl InstallPlan {
     }
     pub fn tuning(&self) -> bool {
         self.tuning
+    }
+    pub fn graphics(&self) -> &crate::graphics::Graphics {
+        &self.graphics
     }
     pub(crate) fn take_password(&mut self) -> Zeroizing<String> {
         Zeroizing::new(std::mem::take(&mut *self.password))
@@ -337,6 +346,7 @@ impl ConfirmedInstall {
             allow_unfree: plan.allow_unfree,
             swap: plan.swap,
             tuning: plan.tuning,
+            graphics: plan.graphics,
         }
     }
 }

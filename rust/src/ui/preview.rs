@@ -138,6 +138,13 @@ pub fn apply(ui: &Rc<Ui>) {
         unfree: true,
         swap: true,
         tuning: true,
+        graphics: calamares_nixos::graphics::Graphics {
+            nvidia: Some("PCI:1:0:0".into()),
+            offload: Some(calamares_nixos::graphics::Offload::Intel(
+                "PCI:0:2:0".into(),
+            )),
+        }
+        .describe(true),
     };
     ui.show_review(&review);
     ui.go(Step::Review);

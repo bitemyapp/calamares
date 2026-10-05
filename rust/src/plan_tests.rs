@@ -52,6 +52,7 @@ fn fixture() -> (tempfile::TempDir, Settings, RawRequest) {
         allow_unfree: false,
         swap: true,
         tuning: true,
+        graphics: Default::default(),
         confirmation: "ERASE /dev/vda".into(),
     };
     (dir, settings, request)
@@ -455,4 +456,37 @@ fn filesystem_choice_survives_review_confirmation_and_ipc() {
         value["filesystem"] = bad.into();
         assert!(serde_json::from_value::<RawRequest>(value.clone()).is_err());
     }
+}
+
+#[test]
+fn nvidia_gpus_get_nvidia_driver_only_when_unfree_is_allowed() {
+    use graphics::{Graphics, Offload};
+    let laptop = Graphics {
+        nvidia: Some("PCI:1:0:0".into()),
+        offload: Some(Offload::Intel("PCI:0:2:0".into())),
+    };
+    let (_dir, settings, mut raw) = fixture();
+    raw.allow_unfree = true;
+    raw.graphics = laptop.clone();
+    let text = render(&raw.parse(&settings).unwrap());
+    assert!(text.contains("  calamares.nvidia.enable = true;\n"));
+    assert!(text.contains(
+        "  calamares.nvidia.prime = { nvidiaBusId = \"PCI:1:0:0\"; intelBusId = \"PCI:0:2:0\"; };\n"
+    ));
+    // Declining unfree packages keeps the open-source driver.
+    let (_dir, settings, mut raw) = fixture();
+    raw.graphics = laptop;
+    let text = render(&raw.parse(&settings).unwrap());
+    assert!(!text.contains("calamares.nvidia"));
+    assert!(text.contains("its driver needs unfree packages"));
+    // No NVIDIA GPU, nothing written; forged bus IDs are rejected.
+    let (_dir, settings, raw) = fixture();
+    assert!(!render(&raw.parse(&settings).unwrap()).contains("NVIDIA"));
+    let (_dir, settings, mut raw) = fixture();
+    raw.allow_unfree = true;
+    raw.graphics = Graphics {
+        nvidia: Some("PCI:1:0:0\"; boot.kernelParams = [ \"x\" ]; #".into()),
+        offload: None,
+    };
+    assert!(raw.parse(&settings).is_err());
 }

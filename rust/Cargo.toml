@@ -8,7 +8,7 @@ publish = false
 
 [features]
 default = ["gui", "network"]
-gui = ["dep:gtk", "network"]
+gui = ["dep:gtk", "dep:adw", "network"]
 network = ["dep:glib", "dep:gio"]
 
 [dependencies]
@@ -19,7 +19,8 @@ serde_json = "=1.0.145"
 sha-crypt = "=0.5.0"
 zeroize = { version = "=1.8.2", features = ["derive"] }
 tempfile = "=3.23.0"
-gtk = { package = "gtk4", version = "=0.10.3", optional = true }
+gtk = { package = "gtk4", version = "=0.10.3", optional = true, features = ["v4_18"] }
+adw = { package = "libadwaita", version = "=0.8.1", optional = true, features = ["v1_7"] }
 glib = { version = "=0.21.5", optional = true }
 gio = { version = "=0.21.5", optional = true }
 

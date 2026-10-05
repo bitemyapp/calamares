@@ -54,15 +54,20 @@ pub enum Desktop {
     Cinnamon,
     Mate,
     Lxqt,
+    Hyprland,
+    /// Hyprland with an Omarchy-style configuration, as its own login session.
+    Omarchy,
 }
 impl Desktop {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Plasma,
         Self::Gnome,
         Self::Xfce,
         Self::Cinnamon,
         Self::Mate,
         Self::Lxqt,
+        Self::Hyprland,
+        Self::Omarchy,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -72,19 +77,28 @@ impl Desktop {
             Self::Cinnamon => "Cinnamon",
             Self::Mate => "MATE",
             Self::Lxqt => "LXQt",
+            Self::Hyprland => "Hyprland",
+            Self::Omarchy => "Omarchy-style Hyprland",
         }
     }
-    pub fn option(self) -> &'static str {
+    pub fn description(self) -> &'static str {
         match self {
-            Self::Plasma => "services.desktopManager.plasma6",
-            Self::Gnome => "services.desktopManager.gnome",
-            Self::Xfce => "services.xserver.desktopManager.xfce",
-            Self::Cinnamon => "services.xserver.desktopManager.cinnamon",
-            Self::Mate => "services.xserver.desktopManager.mate",
-            Self::Lxqt => "services.xserver.desktopManager.lxqt",
+            Self::Plasma => "Full-featured and familiar, with deep customization.",
+            Self::Gnome => "Focused, modern workflow built around the Activities overview.",
+            Self::Xfce => "Lightweight and traditional; easy on older hardware.",
+            Self::Cinnamon => "Classic layout with a polished, modern feel.",
+            Self::Mate => "The traditional GNOME 2 desktop, steady and simple.",
+            Self::Lxqt => "Very lightweight Qt desktop.",
+            Self::Hyprland => {
+                "Dynamic tiling Wayland compositor with its upstream default configuration."
+            }
+            Self::Omarchy => {
+                "Keyboard-driven Hyprland in the style of Omarchy: Waybar, Walker, Mako and themes."
+            }
         }
     }
-    pub fn session(self) -> &'static str {
+    /// Value of `calamares.desktops` in the installed configuration.
+    pub fn id(self) -> &'static str {
         match self {
             Self::Plasma => "plasma",
             Self::Gnome => "gnome",
@@ -92,6 +106,31 @@ impl Desktop {
             Self::Cinnamon => "cinnamon",
             Self::Mate => "mate",
             Self::Lxqt => "lxqt",
+            Self::Hyprland => "hyprland",
+            Self::Omarchy => "omarchy",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn ids_match_serde_names_and_hyprland_flavors_combine() {
+        for desktop in Desktop::ALL {
+            assert_eq!(
+                serde_json::to_string(&desktop).unwrap(),
+                format!("\"{}\"", desktop.id())
+            );
+        }
+        let both =
+            DesktopSelection::parse(vec![Desktop::Hyprland, Desktop::Omarchy], Desktop::Omarchy)
+                .unwrap();
+        assert_eq!(both.default(), Desktop::Omarchy);
+        assert!(
+            DesktopSelection::parse(vec![Desktop::Gnome, Desktop::Cinnamon], Desktop::Gnome)
+                .is_err()
+        );
+        assert!(DesktopSelection::parse(vec![Desktop::Hyprland], Desktop::Plasma).is_err());
     }
 }

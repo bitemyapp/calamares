@@ -3,14 +3,16 @@
 //! Fixed public test credentials, only inside serial/size/live-root guarded VMs.
 use anyhow::{Context, Result, ensure};
 use calamares_nixos::{
-    Filesystem, Firmware, Hostname, Kernel, RawRequest, Settings, config, disk, process::output,
+    Desktop, Filesystem, Firmware, Hostname, Kernel, RawRequest, Settings, config, disk,
+    filesystem::Identities, install::Event, memory, process::output, session::Confirmation,
 };
 use std::{
     fs,
-    io::Write,
+    io::{BufRead, BufReader, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Instant,
 };
 
 const PASSWORD: &str = "Qemu-Only-Test-123!";
@@ -32,15 +34,64 @@ fn zoneinfo() -> Result<std::path::PathBuf> {
         .context("No tzdata found for the test fixture")
 }
 
-fn invoke(request: RawRequest, preflight: bool) -> Result<()> {
+fn helper() -> Result<PathBuf> {
     let package = fs::read_to_string("/run/calamares-package-path")?;
-    let helper = if std::env::var_os("CALAMARES_VM_DEV_BACKEND").is_some() {
+    Ok(if std::env::var_os("CALAMARES_VM_DEV_BACKEND").is_some() {
         Path::new("/workspace/rust/target/x86_64-unknown-linux-musl/release/calamares-nixos-helper")
             .to_path_buf()
     } else {
         Path::new(package.trim()).join("bin/calamares-nixos-helper")
-    };
-    let mut child = Command::new(helper)
+    })
+}
+/// Drive the helper exactly as the GUI does: send the reviewed plan, wait for
+/// preparation, then send the typed confirmation. Reports the time from the
+/// confirmation (the Install click) to completion.
+fn invoke_session(mut request: RawRequest) -> Result<()> {
+    let phrase = std::mem::take(&mut request.confirmation);
+    let started = Instant::now();
+    let mut child = Command::new(helper()?)
+        .arg("session")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().unwrap();
+    let mut line = serde_json::to_vec(&request)?;
+    line.push(b'\n');
+    stdin.write_all(&line)?;
+    let mut confirmed = None;
+    let mut complete = false;
+    for text in BufReader::new(child.stdout.take().unwrap()).lines() {
+        let text = text?;
+        println!("{text}");
+        match serde_json::from_str::<Event>(&text) {
+            Ok(Event::Prepared { .. }) => {
+                println!("PREPARED_SECONDS={:.1}", started.elapsed().as_secs_f64());
+                let mut line = serde_json::to_vec(&Confirmation {
+                    confirmation: phrase.clone(),
+                })?;
+                line.push(b'\n');
+                stdin.write_all(&line)?;
+                confirmed = Some(Instant::now());
+            }
+            Ok(Event::Complete) => complete = true,
+            _ => {}
+        }
+    }
+    ensure!(
+        child.wait()?.success() && complete,
+        "Helper session did not complete"
+    );
+    println!(
+        "CLICK_TO_COMPLETE_SECONDS={:.1}",
+        confirmed
+            .context("Preparation never finished")?
+            .elapsed()
+            .as_secs_f64()
+    );
+    Ok(())
+}
+fn invoke(request: RawRequest, preflight: bool) -> Result<()> {
+    let mut child = Command::new(helper()?)
         .arg(if preflight { "preflight" } else { "install" })
         .stdin(Stdio::piped())
         .spawn()?;
@@ -139,6 +190,21 @@ fn selected_applications() -> Vec<String> {
         Err(_) => calamares_nixos::applications::default_selection(),
     }
 }
+fn selected_desktops() -> Result<Vec<Desktop>> {
+    std::env::var("CALAMARES_TEST_DESKTOPS")
+        .unwrap_or_else(|_| "plasma,xfce".into())
+        .split(',')
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            Ok(serde_json::from_value(serde_json::Value::String(
+                id.into(),
+            ))?)
+        })
+        .collect()
+}
+fn flag(name: &str) -> bool {
+    !matches!(std::env::var(name).as_deref(), Ok("0" | "false"))
+}
 fn request() -> Result<RawRequest> {
     Ok(RawRequest {
         disk: disk::vm_test_disk()?,
@@ -151,15 +217,16 @@ fn request() -> Result<RawRequest> {
         locale: "en_US.UTF-8".into(),
         timezone: "America/Chicago".into(),
         keyboard: "us".into(),
-        desktops: vec![
-            calamares_nixos::Desktop::Plasma,
-            calamares_nixos::Desktop::Xfce,
-        ],
-        default_desktop: calamares_nixos::Desktop::Plasma,
+        default_desktop: *selected_desktops()?
+            .first()
+            .context("Select a test desktop")?,
+        desktops: selected_desktops()?,
         applications: selected_applications(),
         copy_wifi: true,
         wifi_profiles: vec![TEST_WIFI.into()],
         allow_unfree: calamares_nixos::DEFAULT_ALLOW_UNFREE,
+        swap: flag("CALAMARES_TEST_SWAP"),
+        tuning: flag("CALAMARES_TEST_TUNING"),
         confirmation: format!("ERASE {}", disk::vm_test_disk()?.path),
     })
 }
@@ -229,7 +296,6 @@ fn main() -> Result<()> {
     ) {
         // Non-destructive host-side generation for Nix module evaluation.
         // Produces the actual backend output, never a second implementation.
-        use calamares_nixos::Desktop;
         let settings = Settings {
             template_dir: "/unused".into(),
             zoneinfo: zoneinfo()?.to_string_lossy().into_owned(),
@@ -266,7 +332,7 @@ fn main() -> Result<()> {
                 false,
             ));
         } else {
-            for bits in 1u8..64 {
+            for bits in 1u16..256 {
                 let desktops: Vec<_> = Desktop::ALL
                     .iter()
                     .enumerate()
@@ -277,7 +343,7 @@ fn main() -> Result<()> {
                 }
                 let name = desktops
                     .iter()
-                    .map(|d| d.session())
+                    .map(|d| d.id())
                     .collect::<Vec<_>>()
                     .join("-");
                 cases.push((
@@ -314,14 +380,19 @@ fn main() -> Result<()> {
                 copy_wifi: false,
                 wifi_profiles: vec![],
                 allow_unfree,
+                swap: true,
+                tuning: true,
                 confirmation: "ERASE /dev/vda".into(),
             };
             configs.insert(
                 name,
-                config::installed_configuration(
+                config::configuration(
                     &r.parse(&settings)?,
-                    "11111111-2222-3333-4444-555555555555",
-                    Some("A1B2-C3D4"),
+                    &Identities {
+                        root: "11111111-2222-4333-8444-555555555555".into(),
+                        efi: Some("A1B2-C3D4".into()),
+                        swap: Some("66666666-7777-4888-9999-aaaaaaaaaaaa".into()),
+                    },
                 )?,
             );
         }
@@ -470,7 +541,11 @@ fn main() -> Result<()> {
                 "Preflight wrote to disk"
             );
             seed_previous_filesystem(&test_disk)?;
-            invoke(request()?, false)?;
+            if flag("CALAMARES_TEST_SESSION") {
+                invoke_session(request()?)?;
+            } else {
+                invoke(request()?, false)?;
+            }
             ensure!(
                 before == output("sha256sum", &["/etc/calamares-nixos/flake.lock"], 10)?,
                 "Media lock changed"
@@ -509,14 +584,26 @@ fn main() -> Result<()> {
                 "Installed root filesystem differs from the requested choice"
             );
             println!("ROOT_FILESYSTEM={}", selected_filesystem()?.name());
+            // Hardware detection runs before erasure without filesystems; the
+            // configuration pins identities that the installer chose, requested
+            // when formatting and verified. They must be the booted ones.
             let hardware = fs::read_to_string("/etc/nixos/hardware-configuration.nix")?;
             ensure!(
-                hardware.contains(&format!("fsType = \"{}\"", selected_filesystem()?.name())),
-                "Generated hardware configuration lost the root filesystem"
+                !hardware.contains("fileSystems.") && !hardware.contains("swapDevices"),
+                "Hardware detection unexpectedly declared filesystems"
+            );
+            let installed = fs::read_to_string("/etc/nixos/configuration.nix")?;
+            let root_uuid = output("findmnt", &["-n", "-o", "UUID", "/"], 10)?;
+            ensure!(
+                installed.contains(&format!("/dev/disk/by-uuid/{}", root_uuid.trim()))
+                    && installed
+                        .contains(&format!("fsType = \"{}\"", selected_filesystem()?.name())),
+                "Configuration does not pin the booted root filesystem"
             );
             ensure!(
-                hardware.contains("/dev/disk/by-uuid/"),
-                "Hardware configuration lacks persistent UUIDs"
+                output("findmnt", &["-n", "-o", "OPTIONS", "--mountpoint", "/"], 10)?
+                    .contains("noatime"),
+                "Root is not mounted noatime"
             );
             if selected_filesystem()? == Filesystem::Btrfs {
                 ensure!(
@@ -613,18 +700,78 @@ fn main() -> Result<()> {
             )?;
             output("systemctl", &["is-active", "wpa_supplicant"], 15)?;
             println!("HARDWARE_DEFAULTS=redistributable-firmware,unfree,wpa_supplicant");
-            let selected = calamares_nixos::Desktop::ALL
+            let option = |name: &str| {
+                configuration
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix(name))
+                    .map(|value| value.trim_end_matches(';').trim().to_owned())
+            };
+            let default =
+                option("calamares.defaultDesktop = ").context("No explicit default desktop")?;
+            let selected = Desktop::ALL
                 .iter()
-                .find(|d| configuration.contains(&format!("defaultSession = \"{}\";", d.session())))
-                .context("No explicit default desktop")?;
-            println!("DESKTOP_SESSION={}", selected.session());
-            let enabled = calamares_nixos::Desktop::ALL
+                .find(|d| default == format!("\"{}\"", d.id()))
+                .context("Unknown default desktop")?;
+            println!("DESKTOP_SESSION={}", selected.id());
+            let desktops = option("calamares.desktops = ").context("No desktop selection")?;
+            let enabled = Desktop::ALL
                 .iter()
-                .filter(|d| configuration.contains(&format!("{}.enable = true;", d.option())))
-                .map(|d| d.session())
+                .filter(|d| desktops.contains(&format!("\"{}\"", d.id())))
+                .map(|d| d.id())
                 .collect::<Vec<_>>()
                 .join(",");
             println!("DESKTOPS={enabled}");
+            if configuration.contains("calamares.zswap.enable = true;") {
+                let swaps = output(
+                    "swapon",
+                    &["--show=TYPE,SIZE", "--bytes", "--noheadings"],
+                    10,
+                )?;
+                let size: u64 = swaps
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix("partition"))
+                    .context("Swap partition is not active")?
+                    .trim()
+                    .parse()?;
+                let expected = memory::swap_bytes(memory::read()?.total);
+                // swapon excludes the one-page swap header.
+                ensure!(
+                    expected - size <= 1024 * 1024,
+                    "Swap is {size} bytes; RAM-matched size is {expected}"
+                );
+                ensure!(
+                    fs::read_to_string("/sys/module/zswap/parameters/enabled")?.trim() == "Y",
+                    "zswap is not enabled"
+                );
+                ensure!(
+                    fs::read_to_string("/proc/sys/vm/swappiness")?.trim() == "100",
+                    "Swappiness is not 100"
+                );
+                ensure!(
+                    fs::read_to_string("/proc/cmdline")?.contains("resume="),
+                    "Hibernation resume device missing"
+                );
+                println!("SWAP=partition,{size},zswap,swappiness=100,resume");
+            }
+            // The helper leaves its stage timings for hardware measurements.
+            let record: serde_json::Value =
+                serde_json::from_slice(&fs::read("/var/log/calamares-nixos/install.json")?)?;
+            ensure!(
+                record["stages"]["storage"].is_number() && record["prepared"].is_object(),
+                "Installation timing record is incomplete"
+            );
+            println!(
+                "INSTALL_RECORD={}",
+                serde_json::to_string(&record["stages"])?
+            );
+            if configuration.contains("calamares.tuning.enable = true;") {
+                output("systemctl", &["is-active", "ananicy-cpp"], 15)?;
+                ensure!(
+                    fs::read_to_string("/proc/sys/vm/dirty_bytes")?.trim() == "268435456",
+                    "CachyOS dirty limits missing"
+                );
+                println!("TUNING=ananicy-cpp,dirty_bytes");
+            }
             ensure!(
                 output(
                     "timedatectl",

@@ -55,6 +55,11 @@ pub fn parse(text: &str) -> Result<Vec<Disk>> {
             continue;
         }
         let s = |key: &str| node[key].as_str().unwrap_or("").trim().to_string();
+        // The live session's compressed RAM swap is never a target; listing
+        // it as an unavailable disk only confuses.
+        if s("path").starts_with("/dev/zram") {
+            continue;
+        }
         let bytes = node["size"].as_u64().context("Missing disk size")?;
         let blocked = if node["ro"] != false {
             Some("Read-only device")
@@ -176,19 +181,122 @@ pub fn vm_test_disk() -> Result<Identity> {
     Ok(disk.identity)
 }
 
+const MIB: u64 = 1024 * 1024;
+/// The installed root filesystem must keep at least this much space.
+pub const MIN_ROOT_BYTES: u64 = 20 * 1024 * MIB;
+
+/// Exact GPT geometry in MiB: boot (ESP or BIOS boot), root, optional swap at
+/// the end. Explicit aligned boundaries let the kernel's view be checked
+/// exactly instead of trusting that partition names exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub boot: (u64, u64),
+    pub root: (u64, u64),
+    pub swap: Option<(u64, u64)>,
+}
+impl Layout {
+    pub fn new(
+        disk_bytes: u64,
+        firmware: crate::Firmware,
+        swap_bytes: Option<u64>,
+    ) -> Result<Self> {
+        let boot = if firmware == crate::Firmware::Uefi {
+            (1, 1025)
+        } else {
+            (1, 3)
+        };
+        // Leave the final MiB for the backup GPT (33 sectors at 512 bytes,
+        // 5 at 4096) and partition alignment.
+        let end = (disk_bytes / MIB)
+            .checked_sub(1)
+            .context("Disk is too small")?;
+        let swap_mib = swap_bytes.map(|bytes| bytes.div_ceil(MIB));
+        let root_end = end
+            .checked_sub(swap_mib.unwrap_or(0))
+            .filter(|root_end| *root_end > boot.1)
+            .context("Disk is too small for the swap partition")?;
+        let layout = Self {
+            boot,
+            root: (boot.1, root_end),
+            swap: swap_mib.map(|_| (root_end, end)),
+        };
+        ensure!(
+            layout.root_bytes() >= MIN_ROOT_BYTES,
+            "The root filesystem would have only {:.1} GiB; at least {} GiB is required{}",
+            layout.root_bytes() as f64 / 1024f64.powi(3),
+            MIN_ROOT_BYTES / 1024u64.pow(3),
+            if swap_bytes.is_some() {
+                ". Disable the RAM-sized swap partition or choose a larger disk"
+            } else {
+                ""
+            }
+        );
+        Ok(layout)
+    }
+    pub fn root_bytes(&self) -> u64 {
+        (self.root.1 - self.root.0) * MIB
+    }
+    pub fn swap_bytes(&self) -> Option<u64> {
+        self.swap.map(|(start, end)| (end - start) * MIB)
+    }
+    /// One parted invocation: fewer partition-table rereads and udev events.
+    pub(crate) fn parted_script(&self, firmware: crate::Firmware, filesystem: &str) -> Vec<String> {
+        // Binary units are exact in parted; decimal units are rounded.
+        let mut script = vec!["mklabel".into(), "gpt".into()];
+        let mut part = |name: &str, kind: &str, (start, end): (u64, u64)| {
+            script.extend([
+                "mkpart".into(),
+                name.into(),
+                kind.into(),
+                format!("{start}MiB"),
+                format!("{end}MiB"),
+            ]);
+        };
+        if firmware == crate::Firmware::Uefi {
+            part("ESP", "fat32", self.boot);
+        } else {
+            part("BIOS", "", self.boot);
+        }
+        part("root", filesystem, self.root);
+        if let Some(swap) = self.swap {
+            part("swap", "linux-swap", swap);
+        }
+        script.retain(|word| !word.is_empty());
+        script.extend(
+            if firmware == crate::Firmware::Uefi {
+                ["set", "1", "esp", "on"]
+            } else {
+                ["set", "1", "bios_grub", "on"]
+            }
+            .map(String::from),
+        );
+        script
+    }
+    fn partitions(&self) -> Vec<(u8, (u64, u64))> {
+        let mut partitions = vec![(1, self.boot), (2, self.root)];
+        partitions.extend(self.swap.map(|swap| (3, swap)));
+        partitions
+    }
+}
+
 /// Require the kernel's actual partition geometry, not merely existing names.
 /// sysfs start/size are always in 512-byte sectors, including on 4Kn NVMe.
-pub(crate) fn verify_layout(disk: &Identity, firmware: crate::Firmware) -> Result<()> {
+pub(crate) fn verify_layout(disk: &Identity, layout: &Layout) -> Result<()> {
     let parent = Path::new("/sys/dev/block")
         .join(&disk.major_minor)
         .canonicalize()?;
-    let root_start = if firmware == crate::Firmware::Uefi {
-        1025
-    } else {
-        3
-    } * 1024
-        * 1024;
-    for index in [1, 2] {
+    let expected = layout.partitions();
+    // A leftover partition 4+ would mean the table was not fully replaced.
+    let count = fs::read_dir(&parent)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().join("partition").exists())
+        .count();
+    ensure!(
+        count == expected.len(),
+        "Expected {} partitions, the kernel reports {count}",
+        expected.len()
+    );
+    for (index, (start_mib, end_mib)) in expected {
         let device = partition(&disk.path, index);
         let meta = fs::metadata(&device)?;
         ensure!(
@@ -221,48 +329,55 @@ pub(crate) fn verify_layout(disk: &Identity, firmware: crate::Firmware) -> Resul
             .checked_mul(512)
             .context("Partition size overflow")?;
         ensure!(
-            layout_matches(index, start, size, root_start, disk.bytes),
+            start == start_mib * MIB && size == (end_mib - start_mib) * MIB,
             "Unexpected partition geometry for {device}: start {start}, size {size}"
         );
     }
     Ok(())
-}
-fn layout_matches(index: u8, start: u64, size: u64, root_start: u64, disk_bytes: u64) -> bool {
-    if index == 1 {
-        start == 1024 * 1024 && size == root_start - start
-    } else {
-        start == root_start
-            && size > 0
-            && start
-                .checked_add(size)
-                .is_some_and(|end| end <= disk_bytes && disk_bytes - end <= 2 * 1024 * 1024)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn rejects_stale_partition_geometry() {
-        let bytes = 40 * 1024u64.pow(3);
-        let start = 1025 * 1024 * 1024;
-        assert!(layout_matches(1, 1024 * 1024, 1024u64.pow(3), start, bytes));
-        assert!(layout_matches(
-            2,
-            start,
-            bytes - start - 512 * 33,
-            start,
-            bytes
-        ));
-        assert!(!layout_matches(
-            2,
-            3 * 1024 * 1024,
-            bytes - start,
-            start,
-            bytes
-        ));
-        assert!(!layout_matches(2, start, bytes, start, bytes));
-        assert!(!layout_matches(2, start, 1024u64.pow(3), start, bytes));
+    fn layout_reserves_ram_sized_swap_at_the_end() {
+        use crate::Firmware;
+        let gib = 1024u64.pow(3);
+        let layout = Layout::new(512 * gib, Firmware::Uefi, Some(32 * gib)).unwrap();
+        assert_eq!(layout.boot, (1, 1025));
+        assert_eq!(layout.root.0, 1025);
+        assert_eq!(layout.swap_bytes(), Some(32 * gib));
+        assert_eq!(layout.swap.unwrap().1, 512 * 1024 - 1);
+        assert_eq!(layout.root.1, layout.swap.unwrap().0);
+        let bios = Layout::new(40 * gib, Firmware::Bios, None).unwrap();
+        assert_eq!(bios.boot, (1, 3));
+        assert_eq!(bios.root, (3, 40 * 1024 - 1));
+        assert!(bios.swap.is_none());
+        // Swap may not squeeze root below its minimum.
+        assert!(Layout::new(40 * gib, Firmware::Uefi, Some(32 * gib)).is_err());
+        assert!(Layout::new(gib / 2, Firmware::Uefi, None).is_err());
+        assert_eq!(
+            layout.parted_script(Firmware::Uefi, "ext4").join(" "),
+            format!(
+                "mklabel gpt mkpart ESP fat32 1MiB 1025MiB mkpart root ext4 1025MiB {}MiB mkpart swap linux-swap {}MiB {}MiB set 1 esp on",
+                layout.root.1,
+                layout.root.1,
+                layout.swap.unwrap().1
+            )
+        );
+        assert_eq!(
+            bios.parted_script(Firmware::Bios, "xfs").join(" "),
+            format!(
+                "mklabel gpt mkpart BIOS 1MiB 3MiB mkpart root xfs 3MiB {}MiB set 1 bios_grub on",
+                bios.root.1
+            )
+        );
+    }
+    #[test]
+    fn live_zram_is_not_listed() {
+        let disks = parse(r#"{"blockdevices":[{"type":"disk","path":"/dev/zram0","size":16000000000,"ro":false,"mountpoints":["[SWAP]"]},{"type":"disk","path":"/dev/vda","size":42949672960,"ro":false}]}"#).unwrap();
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0].identity.path, "/dev/vda");
     }
     #[test]
     fn flat_device_list_is_rejected() {

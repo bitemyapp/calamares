@@ -5,8 +5,12 @@ pub mod desktop;
 pub mod disk;
 pub mod filesystem;
 pub mod install;
+pub mod memory;
+pub mod nixlog;
 pub mod plan;
+pub mod precache;
 pub mod process;
+pub mod session;
 pub use filesystem::Filesystem;
 pub use plan::{ConfirmedInstall, Hostname, InstallPlan, RawRequest, Username};
 pub mod timezone;
@@ -20,6 +24,9 @@ use serde::{Deserialize, Serialize};
 use std::{fs, os::unix::fs::MetadataExt, path::Path};
 
 pub const SETTINGS: &str = "/etc/calamares-nixos/settings.json";
+fn enabled() -> bool {
+    true
+}
 /// Hardware-friendly GUI default; the review page and request retain an opt-out.
 pub const DEFAULT_ALLOW_UNFREE: bool = true;
 

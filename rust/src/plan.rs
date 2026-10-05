@@ -33,6 +33,12 @@ pub struct RawRequest {
     pub copy_wifi: bool,
     pub wifi_profiles: Vec<String>,
     pub allow_unfree: bool,
+    /// Swap partition matched to installed RAM, fronted by zswap.
+    #[serde(default = "crate::enabled")]
+    pub swap: bool,
+    /// CachyOS-inspired kernel, memory, I/O and service defaults.
+    #[serde(default = "crate::enabled")]
+    pub tuning: bool,
     pub confirmation: String,
 }
 impl Drop for RawRequest {
@@ -135,6 +141,8 @@ pub struct InstallPlan {
     applications: crate::applications::ApplicationSelection,
     wifi: WifiTransfer,
     allow_unfree: bool,
+    swap: bool,
+    tuning: bool,
 }
 
 impl RawRequest {
@@ -195,6 +203,8 @@ impl RawRequest {
             applications,
             wifi,
             allow_unfree: self.allow_unfree,
+            swap: self.swap,
+            tuning: self.tuning,
         })
     }
 
@@ -248,6 +258,12 @@ impl InstallPlan {
     pub fn allow_unfree(&self) -> bool {
         self.allow_unfree
     }
+    pub fn swap(&self) -> bool {
+        self.swap
+    }
+    pub fn tuning(&self) -> bool {
+        self.tuning
+    }
     pub(crate) fn take_password(&mut self) -> Zeroizing<String> {
         Zeroizing::new(std::mem::take(&mut *self.password))
     }
@@ -259,6 +275,14 @@ impl InstallPlan {
             self.wifi = WifiTransfer::parse(true, crate::wifi::snapshot()?, &self.username)?;
         }
         Ok(self)
+    }
+
+    /// Downgrade at IPC for a preparation session. The privileged helper
+    /// parses it again and accepts a separate confirmation phrase later.
+    pub fn into_request(self) -> RawRequest {
+        let mut request = ConfirmedInstall(self).into_request();
+        request.confirmation.clear();
+        request
     }
 
     /// Pure, cheap comparison: safe in a GUI callback. This is not authorization
@@ -311,6 +335,8 @@ impl ConfirmedInstall {
             copy_wifi,
             wifi_profiles,
             allow_unfree: plan.allow_unfree,
+            swap: plan.swap,
+            tuning: plan.tuning,
         }
     }
 }

@@ -1,849 +1,1869 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! GTK owns widgets only. Filesystem discovery, validation, password hashing,
-//! authorization and installation all run on workers with bounded messages.
+//! GTK owns widgets only. Disk discovery, validation, Wi-Fi snapshots, page
+//! cache warming, authorization and installation all run on workers that
+//! report through one bounded channel drained on the main loop.
+mod applications;
+mod pages;
+#[cfg(debug_assertions)]
+mod preview;
+mod widgets;
+
+use adw::prelude::*;
 use calamares_nixos::{
-    ConfirmedInstall, Desktop, Filesystem, Firmware, InstallPlan, KEYBOARDS, LOCALES, RawRequest,
-    Settings, applications,
-    disk::{self, Disk},
-    install::Event,
+    Desktop, Filesystem, Firmware, Hostname, InstallPlan, KEYBOARDS, LOCALES, RawRequest, Settings,
+    Username,
+    disk::{self, Disk, Layout},
+    install::{Event, Summary},
+    memory::{self, MemInfo},
+    precache,
+    session::{Session, Update},
     timezone,
 };
-use gtk::{
-    Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, DropDown, Entry, Label,
-    Orientation, PasswordEntry, ProgressBar, Spinner, Stack, glib, prelude::*,
-};
+use gtk::{Align, CheckButton, Label, Orientation, glib};
+use pages::*;
 use std::{
     cell::{Cell, RefCell},
-    io::{BufRead, BufReader, Write},
-    process::{Command, Stdio},
     rc::Rc,
-    sync::mpsc::{self, SyncSender},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, SyncSender},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use zeroize::Zeroizing;
+use widgets::{badge, clock, disk_icon, duration, icon, size};
+
+/// Load the stylesheet and the icons shipped with the installer package.
+pub fn load_style() {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(include_str!("../data/style.css"));
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    if let Some(paths) = option_env!("CALAMARES_ICON_PATH") {
+        let theme = gtk::IconTheme::for_display(&display);
+        for path in paths.split(':').filter(|p| !p.is_empty()) {
+            theme.add_search_path(path);
+        }
+        // Consistent symbolic icons regardless of the live desktop's theme.
+        gtk::Settings::for_display(&display).set_gtk_icon_theme_name(Some("Adwaita"));
+    }
+}
 
 enum Message {
     Scanned(Result<(Vec<Disk>, Firmware), String>),
-    Reviewed(Result<Box<InstallPlan>, String>),
-    Event(Event),
-    Finished(Result<(), String>),
+    Memory(Result<MemInfo, String>),
+    Reviewed(u64, Result<(Box<Review>, Session), String>),
+    Session(u64, Update),
     Zone(u64, Result<timezone::Detection, String>),
+    Warm {
+        generation: u64,
+        read: u64,
+        total: u64,
+        done: bool,
+    },
+    Rebooted(Result<(), String>),
 }
 
-fn launch(confirmed: ConfirmedInstall, send: SyncSender<Message>) -> anyhow::Result<()> {
-    let helper = std::env::current_exe()?
-        .parent()
-        .unwrap()
-        .join("calamares-nixos-helper");
-    let mut child = Command::new(option_env!("CALAMARES_PKEXEC").unwrap_or("pkexec"))
-        .arg(helper)
-        .arg("install")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let request = confirmed.into_request();
-    let encoded = Zeroizing::new(serde_json::to_vec(&request)?);
-    let input_result = child.stdin.take().unwrap().write_all(&encoded);
-    drop(encoded);
-    drop(request);
-    // This is the GUI's worker, never its main thread. Do not abandon a helper
-    // if the window's message receiver disappears.
-    let mut completed = false;
-    for line in BufReader::new(child.stdout.take().unwrap()).lines() {
-        let line = line?;
-        if let Ok(event) = serde_json::from_str(&line) {
-            completed |= matches!(event, Event::Complete);
-            let _ = send.send(Message::Event(event));
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Step {
+    Welcome,
+    Disk,
+    Account,
+    Desktop,
+    Applications,
+    Location,
+    Review,
+    Install,
+}
+impl Step {
+    const ALL: [Self; 8] = [
+        Self::Welcome,
+        Self::Disk,
+        Self::Account,
+        Self::Desktop,
+        Self::Applications,
+        Self::Location,
+        Self::Review,
+        Self::Install,
+    ];
+    fn title(self) -> &'static str {
+        match self {
+            Self::Welcome => "Welcome",
+            Self::Disk => "Disk",
+            Self::Account => "Account",
+            Self::Desktop => "Desktop",
+            Self::Applications => "Applications",
+            Self::Location => "Location",
+            Self::Review => "Review",
+            Self::Install => "Install",
         }
     }
-    let status = child.wait()?;
-    input_result?;
-    anyhow::ensure!(
-        status.success(),
-        "Installation did not finish (authorization canceled or helper failed, status {status}). See the status above; do not assume the disk is unchanged."
-    );
-    anyhow::ensure!(
-        completed,
-        "Helper exited without confirming installation completion"
-    );
-    Ok(())
+    fn heading(self) -> &'static str {
+        match self {
+            Self::Welcome => "Welcome",
+            Self::Disk => "Choose a Disk",
+            Self::Account => "Create Your Account",
+            Self::Desktop => "Choose Your Desktops",
+            Self::Applications => "Choose Applications",
+            Self::Location => "Time Zone and Language",
+            Self::Review => "Review and Confirm",
+            Self::Install => "Installing",
+        }
+    }
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Welcome => "go-home-symbolic",
+            Self::Disk => "drive-harddisk-symbolic",
+            Self::Account => "avatar-default-symbolic",
+            Self::Desktop => "video-display-symbolic",
+            Self::Applications => "view-app-grid-symbolic",
+            Self::Location => "mark-location-symbolic",
+            Self::Review => "document-properties-symbolic",
+            Self::Install => "folder-download-symbolic",
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Welcome => "welcome",
+            Self::Disk => "disk",
+            Self::Account => "account",
+            Self::Desktop => "desktop",
+            Self::Applications => "applications",
+            Self::Location => "location",
+            Self::Review => "review",
+            Self::Install => "install",
+        }
+    }
+    fn index(self) -> usize {
+        self as usize
+    }
 }
 
-fn label(text: &str) -> Label {
-    let w = Label::new(Some(text));
-    w.set_xalign(0.0);
-    w.set_wrap(true);
-    w
-}
-fn entry(text: &str) -> Entry {
-    Entry::builder().text(text).hexpand(true).build()
-}
-fn row(grid: &gtk::Grid, index: i32, name: &str, widget: &impl IsA<gtk::Widget>) {
-    grid.attach(&label(name), 0, index, 1, 1);
-    grid.attach(widget, 1, index, 1, 1);
-}
-fn choice(dropdown: &DropDown, values: &[&str]) -> String {
-    values
-        .get(dropdown.selected() as usize)
-        .unwrap_or(&"")
-        .to_string()
-}
-fn disk_index(selected: u32, count: usize) -> Option<usize> {
-    // GTK DropDown's selection model may reselect the first row when asked to
-    // select INVALID_LIST_POSITION. A real placeholder row cannot select a disk.
-    selected
-        .checked_sub(1)
-        .map(|n| n as usize)
-        .filter(|n| *n < count)
+/// Share of the overall progress bar for each step: copying dominates.
+const STEP_WEIGHTS: [f64; 6] = [0.04, 0.08, 0.02, 0.72, 0.10, 0.04];
+
+fn overall_fraction(step: u8, copy_fraction: f64) -> f64 {
+    let step = usize::from(step.clamp(1, 6));
+    let done: f64 = STEP_WEIGHTS[..step - 1].iter().sum();
+    let current = if step == 4 {
+        STEP_WEIGHTS[3] * copy_fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (done + current).clamp(0.0, 1.0)
 }
 
-fn application_page(unfree: &CheckButton) -> (GtkBox, Vec<CheckButton>) {
-    let page = GtkBox::new(Orientation::Vertical, 12);
-    page.append(&label("Choose applications to have ready after installation. You can select any combination and sign in to your accounts later."));
-    let search = gtk::SearchEntry::builder()
-        .placeholder_text("Search applications")
-        .build();
-    page.append(&search);
-    let count = label("");
-    page.append(&count);
-    let checks: Vec<_> = applications::catalog()
-        .iter()
-        .map(|app| {
-            let check = CheckButton::with_label(&app.name);
-            check.set_active(app.id == "firefox");
-            check
-        })
+/// Suggest a valid username from a full name: "Ada Lovelace" → "ada".
+fn suggest_username(full_name: &str) -> String {
+    let first = full_name.split_whitespace().next().unwrap_or("");
+    let name: String = first
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .take(31)
         .collect();
-    let mut groups = Vec::new();
-    let mut previous = "";
-    let mut group = GtkBox::new(Orientation::Vertical, 10);
-    let mut rows = Vec::new();
-    for (app, check) in applications::catalog().iter().zip(&checks) {
-        if app.category != previous {
-            if !rows.is_empty() {
-                groups.push((group, std::mem::take(&mut rows)));
-            }
-            group = GtkBox::new(Orientation::Vertical, 10);
-            let heading = label(&app.category);
-            heading.add_css_class("heading");
-            group.append(&heading);
-            page.append(&group);
-            previous = &app.category;
-        }
-        let item = GtkBox::new(Orientation::Vertical, 3);
-        item.append(check);
-        let description = label(&app.description);
-        description.set_margin_start(28);
-        item.append(&description);
-        let badges = [
-            app.terminal.as_ref().map(|_| "Terminal application"),
-            app.unfree.then_some("Proprietary software"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ");
-        if !badges.is_empty() {
-            let badges = label(&badges);
-            badges.add_css_class("dim-label");
-            badges.set_margin_start(28);
-            item.append(&badges);
-        }
-        group.append(&item);
-        rows.push((
-            item,
-            format!("{} {} {}", app.name, app.description, app.category).to_lowercase(),
-        ));
+    if name.starts_with(|c: char| c.is_ascii_lowercase()) && Username::parse(&name).is_ok() {
+        name
+    } else {
+        String::new()
     }
-    groups.push((group, rows));
-    search.connect_search_changed(move |search| {
-        let query = search.text().to_lowercase();
-        for (group, rows) in &groups {
-            let mut visible = false;
-            for (row, text) in rows {
-                let matches = text.contains(query.trim());
-                row.set_visible(matches);
-                visible |= matches;
-            }
-            group.set_visible(visible);
-        }
-    });
-    let updating = Rc::new(Cell::new(false));
-    let refresh: Rc<dyn Fn()> = Rc::new({
-        let checks: Vec<_> = checks.iter().map(CheckButton::downgrade).collect();
-        let unfree = unfree.downgrade();
-        let count = count.downgrade();
-        move || {
-            if updating.replace(true) {
-                return;
-            }
-            if let (Some(unfree), Some(count)) = (unfree.upgrade(), count.upgrade()) {
-                let checks: Vec<_> = checks.iter().filter_map(glib::WeakRef::upgrade).collect();
-                if checks.len() == applications::catalog().len() {
-                    for (app, check) in applications::catalog().iter().zip(&checks) {
-                        if app.unfree && !unfree.is_active() {
-                            check.set_active(false);
-                        }
-                    }
-                    let required: std::collections::BTreeSet<_> = applications::catalog()
-                        .iter()
-                        .zip(&checks)
-                        .filter(|(_, check)| check.is_active())
-                        .flat_map(|(app, _)| app.requires.iter())
-                        .collect();
-                    for (app, check) in applications::catalog().iter().zip(&checks) {
-                        let needed = required.contains(&app.id);
-                        if needed {
-                            check.set_active(true);
-                        }
-                        check.set_sensitive((!app.unfree || unfree.is_active()) && !needed);
-                        check.set_tooltip_text(if needed { Some("Required by Rustup. Deselect Rustup to make this optional.") }
-                            else if app.unfree && !unfree.is_active() { Some("Enable unfree software on Desktops & Wi-Fi to select this application.") }
-                            else { None });
-                    }
-                    count.set_text(&format!(
-                        "{} selected · Rustup also selects Development build tools",
-                        checks.iter().filter(|check| check.is_active()).count()
-                    ));
-                }
-            }
-            updating.set(false);
-        }
-    });
-    for check in &checks {
-        check.connect_toggled({
-            let refresh = refresh.clone();
-            move |_| refresh()
-        });
-    }
-    unfree.connect_toggled({
-        let refresh = refresh.clone();
-        move |_| refresh()
-    });
-    refresh();
-    (page, checks)
 }
 
-pub fn build(app: &Application) {
+const LOCALE_NAMES: [&str; 8] = [
+    "English (United States)",
+    "English (United Kingdom)",
+    "Deutsch (Deutschland)",
+    "Français (France)",
+    "Español (España)",
+    "Italiano (Italia)",
+    "日本語 (日本)",
+    "Português (Brasil)",
+];
+const KEYBOARD_NAMES: [&str; 8] = [
+    "English (US)",
+    "English (UK)",
+    "German",
+    "French",
+    "Spanish",
+    "Italian",
+    "Japanese",
+    "Portuguese (Brazil)",
+];
+
+/// Display copy of a reviewed plan. The plan itself moves to the helper.
+pub(crate) struct Review {
+    disk: disk::Identity,
+    firmware: Firmware,
+    filesystem: Filesystem,
+    hostname: String,
+    username: String,
+    full_name: String,
+    locale: String,
+    timezone: String,
+    keyboard: String,
+    desktops: Vec<Desktop>,
+    default_desktop: Desktop,
+    applications: String,
+    wifi: bool,
+    wifi_profiles: usize,
+    unfree: bool,
+    swap: bool,
+    tuning: bool,
+}
+impl Review {
+    fn of(plan: &InstallPlan) -> Self {
+        Self {
+            disk: plan.disk().clone(),
+            firmware: plan.firmware(),
+            filesystem: plan.filesystem(),
+            hostname: plan.hostname().as_str().into(),
+            username: plan.username().as_str().into(),
+            full_name: plan.full_name().into(),
+            locale: plan.locale().into(),
+            timezone: plan.timezone().as_str().into(),
+            keyboard: plan.keyboard().into(),
+            desktops: plan.desktops().selected().to_vec(),
+            default_desktop: plan.desktops().default(),
+            applications: plan.applications().names(),
+            wifi: plan.wifi().enabled(),
+            wifi_profiles: plan.wifi().profile_count(),
+            unfree: plan.allow_unfree(),
+            swap: plan.swap(),
+            tuning: plan.tuning(),
+        }
+    }
+}
+
+struct Ui {
+    window: adw::ApplicationWindow,
+    toasts: adw::ToastOverlay,
+    content: adw::ToolbarView,
+    split: adw::NavigationSplitView,
+    sidebar: Sidebar,
+    stack: gtk::Stack,
+    title: adw::WindowTitle,
+    back: gtk::Button,
+    next: gtk::Button,
+    activity: Label,
+    activity_spinner: adw::Spinner,
+    disk: DiskPage,
+    account: AccountPage,
+    desktop: DesktopPage,
+    apps: applications::ApplicationsPage,
+    location: LocationPage,
+    review: ReviewPage,
+    install: InstallPage,
+    send: SyncSender<Message>,
+    step: Cell<Step>,
+    reached: Cell<Step>,
+    disks: RefCell<Vec<Disk>>,
+    firmware: Cell<Firmware>,
+    selected_disk: Cell<Option<usize>>,
+    memory: Cell<Option<MemInfo>>,
+    scanning: Cell<bool>,
+    username_edited: Cell<bool>,
+    filling_username: Cell<bool>,
+    default_desktops: RefCell<Vec<Desktop>>,
+    default_choice: Cell<Option<Desktop>>,
+    updating_default: Cell<bool>,
+    zone_epoch: Cell<u64>,
+    zone_running: Cell<bool>,
+    reviewing: Cell<bool>,
+    generation: Cell<u64>,
+    session: RefCell<Option<Session>>,
+    phrase: RefCell<String>,
+    prepared: Cell<bool>,
+    prep_failed: Cell<bool>,
+    installing: Cell<bool>,
+    started: Cell<Option<Instant>>,
+    install_step: Cell<u8>,
+    copy_fraction: Cell<f64>,
+    completed: Cell<bool>,
+    failed: Cell<bool>,
+    total_seconds: Cell<Option<f64>>,
+    log_lines: Cell<usize>,
+    warm_generation: Cell<u64>,
+    warm_cancel: RefCell<Option<Arc<AtomicBool>>>,
+    warm_timer: RefCell<Option<glib::SourceId>>,
+    closed: Cell<bool>,
+}
+
+pub fn build(app: &adw::Application) {
     if let Some(window) = app.active_window() {
         window.present();
         return;
     }
-    let window = ApplicationWindow::builder()
-        .application(app)
-        .title("NixOS · Rust Calamares")
-        .default_width(900)
-        .default_height(800)
-        .build();
-    let outer = GtkBox::new(Orientation::Vertical, 16);
-    outer.set_margin_top(24);
-    outer.set_margin_bottom(24);
-    outer.set_margin_start(32);
-    outer.set_margin_end(32);
-    let title = label("Install NixOS with Determinate Nix");
-    title.add_css_class("title-1");
-    outer.append(&title);
-    outer.append(&label(
-        "Native Rust installer · your choice of desktops · pinned installation inputs",
-    ));
-    let stack = Stack::new();
+    let (sidebar_page, sidebar) = build_sidebar();
+    let stack = gtk::Stack::new();
+    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    stack.set_transition_duration(180);
     stack.set_vexpand(true);
-    outer.append(&stack);
-    let status_row = GtkBox::new(Orientation::Horizontal, 12);
-    let spinner = Spinner::new();
-    let status = label("Discovering disks…");
-    status.set_hexpand(true);
-    status.set_max_width_chars(95);
-    status.set_lines(4);
-    status.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    status.set_selectable(true);
-    status_row.append(&spinner);
-    status_row.append(&status);
-    outer.append(&status_row);
+    let welcome = build_welcome();
+    let (disk_widget, disk) = build_disk_page();
+    let (account_widget, account) = build_account_page();
+    let (desktop_widget, desktop) = build_desktop_page();
+    // The application page is built before the Ui that owns its callback.
+    let changed_selection: Rc<RefCell<Option<Callback>>> = Rc::new(RefCell::new(None));
+    let apps = applications::build(
+        &desktop.unfree,
+        Rc::new({
+            let changed = changed_selection.clone();
+            move || {
+                if let Some(changed) = changed.borrow().as_ref() {
+                    changed();
+                }
+            }
+        }),
+    );
+    let (location_widget, location) = build_location_page();
+    let review = build_review_page();
+    let install = build_install_page();
+    stack.add_named(&welcome, Some(Step::Welcome.name()));
+    stack.add_named(&disk_widget, Some(Step::Disk.name()));
+    stack.add_named(&account_widget, Some(Step::Account.name()));
+    stack.add_named(&desktop_widget, Some(Step::Desktop.name()));
+    stack.add_named(&apps.widget, Some(Step::Applications.name()));
+    stack.add_named(&location_widget, Some(Step::Location.name()));
+    stack.add_named(&review.page, Some(Step::Review.name()));
+    stack.add_named(&install.stack, Some(Step::Install.name()));
 
-    let setup = GtkBox::new(Orientation::Vertical, 14);
-    let warning = label(
-        "This release supports erasing one whole disk: GPT with ext4, Btrfs or XFS, EFI or legacy BIOS. It does not support manual partitioning, encryption, preserving another OS, or offline installation. Back up your data before continuing.",
-    );
-    warning.add_css_class("warning");
-    setup.append(&warning);
-    let grid = gtk::Grid::builder()
-        .row_spacing(12)
-        .column_spacing(18)
-        .build();
-    let disk_model = gtk::StringList::new(&["Select a disk — no device selected"]);
-    let disks_menu = DropDown::new(Some(disk_model.clone()), None::<gtk::Expression>);
-    disks_menu.set_selected(0);
-    let scan = Button::with_label("Rescan disks");
-    let disks_row = GtkBox::new(Orientation::Horizontal, 8);
-    disks_menu.set_hexpand(true);
-    disks_row.append(&disks_menu);
-    disks_row.append(&scan);
-    row(&grid, 0, "Disk to erase", &disks_row);
-    let hostname = entry("nixos");
-    hostname.set_max_length(63);
-    row(&grid, 1, "Computer name", &hostname);
-    let username = entry("");
-    username.set_max_length(31);
-    row(&grid, 2, "Username", &username);
-    let full_name = entry("");
-    full_name.set_max_length(128);
-    row(&grid, 3, "Full name", &full_name);
-    let password = PasswordEntry::builder().show_peek_icon(true).build();
-    row(&grid, 4, "Password (12+ characters)", &password);
-    let repeat = PasswordEntry::builder().show_peek_icon(true).build();
-    row(&grid, 5, "Repeat password", &repeat);
-    let filesystem = DropDown::from_strings(&Filesystem::ALL.map(Filesystem::label));
-    row(&grid, 6, "Root filesystem", &filesystem);
-    setup.append(&grid);
-    setup.append(&label("Btrfs uses compression on a single root volume; automatic snapshots are not configured. The EFI boot partition uses FAT32."));
-    let location_page = GtkBox::new(Orientation::Vertical, 12);
-    let location_grid = gtk::Grid::builder()
-        .row_spacing(12)
-        .column_spacing(18)
-        .build();
-    let locale = DropDown::from_strings(LOCALES);
-    row(&location_grid, 0, "System locale", &locale);
-    let timezone = entry("");
-    timezone.set_placeholder_text(Some("Detecting… or enter America/Chicago"));
-    timezone.set_max_length(100);
-    row(&location_grid, 1, "Time zone", &timezone);
-    let keyboard = DropDown::from_strings(KEYBOARDS);
-    row(&location_grid, 2, "Installed keyboard layout", &keyboard);
-    location_page.append(&location_grid);
-    let internet_zone = CheckButton::with_label(
-        "Use internet detection if the live time zone is unset (ipapi.co receives your public IP)",
-    );
-    internet_zone.set_active(true);
-    location_page.append(&internet_zone);
-    let detect = Button::with_label("Detect time zone again");
-    let zone_spinner = Spinner::new();
-    let detect_row = GtkBox::new(Orientation::Horizontal, 12);
-    detect_row.append(&detect);
-    detect_row.append(&zone_spinner);
-    location_page.append(&detect_row);
-    let zone_status = label("Checking the live system's time zone…");
-    location_page.append(&zone_status);
-    let zone_confirm =
-        CheckButton::with_label("I have checked that this time zone is correct for my location");
-    location_page.append(&zone_confirm);
-    location_page.append(&label("US Central is America/Chicago; US Eastern is America/New_York. Region-based zones handle daylight saving automatically. Locale and country alone cannot determine your zone."));
-    location_page.append(&label("The live keyboard layout is unchanged. Passwords are entered using the current live layout; confirm it before proceeding."));
-    let desktop_page = GtkBox::new(Orientation::Vertical, 12);
-    desktop_page.append(&label("Choose one or more desktop environments. All selected sessions will be available on the login screen; the live desktop stays Plasma."));
-    let desktops: Vec<_> = Desktop::ALL
-        .iter()
-        .map(|desktop| {
-            let check = CheckButton::with_label(desktop.label());
-            check.set_active(*desktop == Desktop::Plasma);
-            desktop_page.append(&check);
-            check
-        })
-        .collect();
-    let default_desktop = DropDown::from_strings(&Desktop::ALL.map(Desktop::label));
-    desktop_page.append(&label("GNOME and Cinnamon are alternatives: the pinned NixOS modules cannot currently enable both together."));
-    desktop_page.append(&label("Default login session"));
-    desktop_page.append(&default_desktop);
-    for (index, check) in desktops.iter().enumerate() {
-        check.connect_toggled({
-            let desktops = desktops.clone();
-            let default_desktop = default_desktop.clone();
-            move |check| {
-                if check.is_active() && default_desktop.selected() == gtk::INVALID_LIST_POSITION {
-                    default_desktop.set_selected(index as u32);
-                }
-                if !check.is_active() && default_desktop.selected() == index as u32 {
-                    default_desktop.set_selected(
-                        desktops
-                            .iter()
-                            .position(CheckButton::is_active)
-                            .map(|n| n as u32)
-                            .unwrap_or(gtk::INVALID_LIST_POSITION),
-                    );
-                }
-            }
-        });
-    }
-    default_desktop.connect_selected_notify({
-        let desktops = desktops.clone();
-        move |menu| {
-            if let Some(check) = desktops.get(menu.selected() as usize) {
-                check.set_active(true);
-            }
-        }
-    });
-    let copy_wifi = CheckButton::with_label(
-        "Carry my saved live-session Wi-Fi connections and passwords into the installed system",
-    );
-    copy_wifi.set_active(true);
-    desktop_page.append(&copy_wifi);
-    desktop_page.append(&label("Wi-Fi profiles are stored root-only, outside the Nix store. Keep the live wallet unlocked. Enterprise networks using certificate files or hardware tokens must be configured after installation."));
-    let unfree =
-        CheckButton::with_label("Allow unfree software (some hardware drivers require this)");
-    unfree.set_active(calamares_nixos::DEFAULT_ALLOW_UNFREE);
-    desktop_page.append(&unfree);
-    desktop_page.append(&label("Enabled by default. Redistributable firmware is included either way. Allowing unfree packages does not automatically configure every vendor driver."));
-    let (applications_page, applications) = application_page(&unfree);
-    let next = Button::with_label("Review installation");
+    let title = adw::WindowTitle::new(Step::Welcome.heading(), "");
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&title));
+    let back = gtk::Button::with_label("Back");
+    back.add_css_class("pill");
+    let next = gtk::Button::with_label("Get Started");
+    next.add_css_class("pill");
     next.add_css_class("suggested-action");
-    let notebook = gtk::Notebook::new();
-    notebook.set_vexpand(true);
-    for (name, child) in [
-        ("System & account", &setup),
-        ("Desktops & Wi-Fi", &desktop_page),
-        ("Location", &location_page),
-        ("Applications", &applications_page),
-    ] {
-        let scroll = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vexpand(true)
-            .child(child)
-            .build();
-        // Notebook headers must keep their natural width. Wrapping body-text
-        // labels can shrink these tabs enough to clip their last line.
-        notebook.append_page(&scroll, Some(&Label::new(Some(name))));
+    let activity_spinner = adw::Spinner::new();
+    activity_spinner.set_visible(false);
+    let activity = Label::new(None);
+    activity.add_css_class("activity");
+    activity.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let activity_box = gtk::Box::new(Orientation::Horizontal, 8);
+    activity_box.set_hexpand(true);
+    activity_box.set_halign(Align::Center);
+    activity_box.append(&activity_spinner);
+    activity_box.append(&activity);
+    let bar = gtk::Box::new(Orientation::Horizontal, 12);
+    bar.set_margin_top(10);
+    bar.set_margin_bottom(10);
+    bar.set_margin_start(16);
+    bar.set_margin_end(16);
+    bar.append(&back);
+    bar.append(&activity_box);
+    bar.append(&next);
+    let content = adw::ToolbarView::new();
+    content.add_top_bar(&header);
+    content.set_content(Some(&stack));
+    content.add_bottom_bar(&bar);
+    content.set_bottom_bar_style(adw::ToolbarStyle::Raised);
+    let split = adw::NavigationSplitView::new();
+    split.set_sidebar(Some(&sidebar_page));
+    split.set_content(Some(&adw::NavigationPage::new(&content, "Install NixOS")));
+    split.set_min_sidebar_width(230.0);
+    split.set_max_sidebar_width(280.0);
+    split.set_show_content(true);
+    let toasts = adw::ToastOverlay::new();
+    toasts.set_child(Some(&split));
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .title("Install NixOS")
+        .default_width(1100)
+        .default_height(760)
+        .content(&toasts)
+        .build();
+    window.set_size_request(360, 520);
+    let breakpoint = adw::Breakpoint::new(
+        adw::BreakpointCondition::parse("max-width: 760sp").expect("valid breakpoint"),
+    );
+    breakpoint.add_setter(&split, "collapsed", Some(&true.to_value()));
+    window.add_breakpoint(breakpoint);
+
+    let (send, receive) = mpsc::sync_channel::<Message>(128);
+    let ui = Rc::new(Ui {
+        window,
+        toasts,
+        content,
+        split,
+        sidebar,
+        stack,
+        title,
+        back,
+        next,
+        activity,
+        activity_spinner,
+        disk,
+        account,
+        desktop,
+        apps,
+        location,
+        review,
+        install,
+        send,
+        step: Cell::new(Step::Welcome),
+        reached: Cell::new(Step::Welcome),
+        disks: RefCell::new(Vec::new()),
+        firmware: Cell::new(Firmware::Bios),
+        selected_disk: Cell::new(None),
+        memory: Cell::new(None),
+        scanning: Cell::new(false),
+        username_edited: Cell::new(false),
+        filling_username: Cell::new(false),
+        default_desktops: RefCell::new(Vec::new()),
+        default_choice: Cell::new(Some(Desktop::Plasma)),
+        updating_default: Cell::new(false),
+        zone_epoch: Cell::new(0),
+        zone_running: Cell::new(false),
+        reviewing: Cell::new(false),
+        generation: Cell::new(0),
+        session: RefCell::new(None),
+        phrase: RefCell::new(String::new()),
+        prepared: Cell::new(false),
+        prep_failed: Cell::new(false),
+        installing: Cell::new(false),
+        started: Cell::new(None),
+        install_step: Cell::new(0),
+        copy_fraction: Cell::new(0.0),
+        completed: Cell::new(false),
+        failed: Cell::new(false),
+        total_seconds: Cell::new(None),
+        log_lines: Cell::new(0),
+        warm_generation: Cell::new(0),
+        warm_cancel: RefCell::new(None),
+        warm_timer: RefCell::new(None),
+        closed: Cell::new(false),
+    });
+    *changed_selection.borrow_mut() = Some(Rc::new({
+        let ui = Rc::downgrade(&ui);
+        move || {
+            if let Some(ui) = ui.upgrade() {
+                ui.schedule_warm();
+            }
+        }
+    }));
+    ui.connect();
+    ui.sync_desktops();
+    ui.update_layout();
+    ui.go(Step::Welcome);
+    let preview = preview_requested();
+    if !preview {
+        ui.rescan();
+        ui.read_memory();
+        ui.detect_zone();
+        ui.schedule_warm();
     }
-    let setup_page = GtkBox::new(Orientation::Vertical, 12);
-    setup_page.append(&notebook);
-    setup_page.append(&next);
-    stack.add_named(&setup_page, Some("setup"));
-
-    let review = GtkBox::new(Orientation::Vertical, 18);
-    let summary = label("");
-    summary.set_selectable(true);
-    let review_scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&summary)
-        .build();
-    review.append(&review_scroll);
-    let erase = entry("");
-    erase.set_placeholder_text(Some("ERASE /dev/…"));
-    review.append(&erase);
-    let consent = CheckButton::with_label(
-        "I understand that all partitions and data on this disk will be destroyed.",
-    );
-    review.append(&consent);
-    let buttons = GtkBox::new(Orientation::Horizontal, 12);
-    let back = Button::with_label("Back");
-    let install = Button::with_label("Erase disk and install");
-    install.add_css_class("destructive-action");
-    install.set_sensitive(false);
-    buttons.append(&back);
-    buttons.append(&install);
-    review.append(&buttons);
-    stack.add_named(&review, Some("review"));
-
-    let progress_page = GtkBox::new(Orientation::Vertical, 18);
-    let progress_heading = label(
-        "Installation in progress. Keep the computer connected to power and the network. Closing the installer is disabled until this operation finishes.",
-    );
-    progress_page.append(&progress_heading);
-    let progress = ProgressBar::new();
-    progress.set_show_text(true);
-    progress_page.append(&progress);
-    let done = Button::with_label("Close installer");
-    done.set_visible(false);
-    progress_page.append(&done);
-    let failure_details = gtk::TextView::builder()
-        .editable(false)
-        .cursor_visible(false)
-        .wrap_mode(gtk::WrapMode::WordChar)
-        .build();
-    let failure_scroll = gtk::ScrolledWindow::builder()
-        .vexpand(true)
-        .child(&failure_details)
-        .visible(false)
-        .build();
-    progress_page.append(&failure_scroll);
-    stack.add_named(&progress_page, Some("progress"));
-    stack.set_visible_child_name("setup");
-    window.set_child(Some(&outer));
-
-    let (send, receive) = mpsc::sync_channel::<Message>(64);
-    let zone_epoch = Rc::new(Cell::new(0u64));
-    let zone_running = Rc::new(Cell::new(false));
-    timezone.connect_changed({
-        let epoch = zone_epoch.clone();
-        let confirm = zone_confirm.clone();
-        move |_| {
-            epoch.set(epoch.get().wrapping_add(1));
-            confirm.set_active(false);
-        }
-    });
-    let detect_zone: Rc<dyn Fn()> = Rc::new({
-        let running = zone_running.clone();
-        let send = send.clone();
-        let epoch = zone_epoch.clone();
-        let internet = internet_zone.clone();
-        let spinner = zone_spinner.clone();
-        let button = detect.clone();
-        let status = zone_status.clone();
+    glib::timeout_add_local(Duration::from_millis(60), {
+        let ui = ui.clone();
         move || {
-            running.set(true);
-            epoch.set(epoch.get().wrapping_add(1));
-            let generation = epoch.get();
-            let internet = internet.is_active();
-            spinner.start();
-            button.set_sensitive(false);
-            status.set_text("Detecting time zone… you can still edit it manually.");
-            let send = send.clone();
-            thread::spawn(move || {
-                let result = Settings::load()
-                    .and_then(|s| timezone::detect(std::path::Path::new(&s.zoneinfo), internet))
-                    .map_err(|e| format!("{e:#}"));
-                let _ = send.send(Message::Zone(generation, result));
-            });
-        }
-    });
-    detect.connect_clicked({
-        let detect_zone = detect_zone.clone();
-        move |_| detect_zone()
-    });
-    internet_zone.connect_toggled({
-        let epoch = zone_epoch.clone();
-        move |_| epoch.set(epoch.get().wrapping_add(1))
-    });
-    let disks = Rc::new(RefCell::new(Vec::<Disk>::new()));
-    let firmware = Rc::new(Cell::new(Firmware::Bios));
-    let pending = Rc::new(RefCell::new(None::<InstallPlan>));
-    let busy = Rc::new(Cell::new(false));
-    let installing = Rc::new(Cell::new(false));
-    let rescan: Rc<dyn Fn()> = Rc::new({
-        let send = send.clone();
-        let busy = busy.clone();
-        let spinner = spinner.clone();
-        let status = status.clone();
-        let next = next.clone();
-        let scan = scan.clone();
-        move || {
-            if busy.replace(true) {
-                return;
-            }
-            spinner.start();
-            status.set_text("Discovering disks…");
-            next.set_sensitive(false);
-            scan.set_sensitive(false);
-            let send = send.clone();
-            thread::spawn(move || {
-                let result = disk::discover()
-                    .map(|d| (d, Firmware::current()))
-                    .map_err(|e| format!("{e:#}"));
-                let _ = send.send(Message::Scanned(result));
-            });
-        }
-    });
-    scan.connect_clicked({
-        let rescan = rescan.clone();
-        move |_| rescan()
-    });
-
-    next.connect_clicked({
-        let send = send.clone();
-        let disks = disks.clone();
-        let firmware = firmware.clone();
-        let busy = busy.clone();
-        let spinner = spinner.clone();
-        let status = status.clone();
-        let next = next.clone();
-        let scan = scan.clone();
-        let disks_menu = disks_menu.clone();
-        let password = password.clone();
-        let repeat = repeat.clone();
-        let setup_page = setup_page.clone();
-        let timezone = timezone.clone();
-        move |_| {
-            if busy.get() {
-                return;
-            }
-            let selected = disk_index(disks_menu.selected(), disks.borrow().len());
-            let Some(disk) = selected.and_then(|n| disks.borrow().get(n).cloned()) else {
-                status.set_text("Select a disk first. No disk is selected automatically.");
-                return;
-            };
-            if let Some(reason) = disk.blocked {
-                status.set_text(&reason);
-                return;
-            }
-            if password.text() != repeat.text() {
-                status.set_text("The passwords do not match.");
-                return;
-            }
-            if !zone_confirm.is_active() {
-                notebook.set_current_page(Some(2));
-                status.set_text(
-                    "Check the time zone on the Location tab and confirm it before continuing.",
-                );
-                return;
-            }
-            let Some(root_filesystem) =
-                Filesystem::ALL.get(filesystem.selected() as usize).copied()
-            else {
-                status.set_text("Select a root filesystem before continuing.");
-                return;
-            };
-            let request = RawRequest {
-                confirmation: String::new(),
-                disk: disk.identity,
-                firmware: firmware.get(),
-                filesystem: root_filesystem,
-                hostname: hostname.text().into(),
-                username: username.text().into(),
-                full_name: full_name.text().into(),
-                password: password.text().into(),
-                locale: choice(&locale, LOCALES),
-                timezone: timezone.text().into(),
-                keyboard: choice(&keyboard, KEYBOARDS),
-                desktops: Desktop::ALL
-                    .iter()
-                    .zip(&desktops)
-                    .filter_map(|(desktop, check)| check.is_active().then_some(*desktop))
-                    .collect(),
-                default_desktop: Desktop::ALL
-                    .get(default_desktop.selected() as usize)
-                    .copied()
-                    .unwrap_or(Desktop::Plasma),
-                applications: applications::catalog()
-                    .iter()
-                    .zip(&applications)
-                    .filter_map(|(app, check)| check.is_active().then_some(app.id.clone()))
-                    .collect(),
-                copy_wifi: copy_wifi.is_active(),
-                wifi_profiles: vec![],
-                allow_unfree: unfree.is_active(),
-            };
-            busy.set(true);
-            setup_page.set_sensitive(false);
-            spinner.start();
-            status.set_text("Checking your settings…");
-            next.set_sensitive(false);
-            scan.set_sensitive(false);
-            let send = send.clone();
-            thread::spawn(move || {
-                let result = (|| -> anyhow::Result<Box<InstallPlan>> {
-                    let plan = request.parse(&Settings::load()?)?;
-                    disk::revalidate(plan.disk())?;
-                    Ok(Box::new(plan.snapshot_wifi()?))
-                })()
-                .map_err(|e| format!("{e:#}"));
-                let _ = send.send(Message::Reviewed(result));
-            });
-        }
-    });
-    let confirm: Rc<dyn Fn()> = Rc::new({
-        let erase = erase.clone();
-        let consent = consent.clone();
-        let pending = pending.clone();
-        let install = install.clone();
-        move || {
-            install.set_sensitive(
-                consent.is_active()
-                    && pending
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|r| erase.text() == format!("ERASE {}", r.disk().path)),
-            );
-        }
-    });
-    erase.connect_changed({
-        let confirm = confirm.clone();
-        move |_| confirm()
-    });
-    consent.connect_toggled(move |_| confirm());
-    back.connect_clicked({
-        let stack = stack.clone();
-        let pending = pending.clone();
-        let status = status.clone();
-        move |_| {
-            pending.borrow_mut().take();
-            stack.set_visible_child_name("setup");
-            status.set_text("Review your settings, then continue.");
-        }
-    });
-    install.connect_clicked({
-        let send = send.clone();
-        let pending = pending.clone();
-        let busy = busy.clone();
-        let installing = installing.clone();
-        let spinner = spinner.clone();
-        let stack = stack.clone();
-        let status = status.clone();
-        let erase = erase.clone();
-        move |_| {
-            let Some(plan) = pending.borrow_mut().take() else { return; };
-            let confirmed = match plan.confirm(erase.text().as_str()) {
-                Ok(confirmed) => confirmed,
-                Err(error) => {
-                    stack.set_visible_child_name("setup");
-                    status.set_text(&error.to_string());
-                    return;
-                }
-            };
-            password.set_text("");
-            repeat.set_text("");
-            busy.set(true);
-            installing.set(true);
-            spinner.start();
-            stack.set_visible_child_name("progress");
-            status.set_text("Waiting for authorization. The helper will repeat all safety checks before any disk write.");
-            let send = send.clone();
-            thread::spawn(move || {
-                let outcome = launch(confirmed, send.clone()).map_err(|e| format!("{e:#}"));
-                let _ = send.send(Message::Finished(outcome));
-            });
-        }
-    });
-    done.connect_clicked({
-        let window = window.clone();
-        move |_| window.close()
-    });
-    window.connect_close_request({
-        let installing = installing.clone();
-        move |_| {
-            if installing.get() {
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
-            }
-        }
-    });
-
-    glib::timeout_add_local(Duration::from_millis(80), {
-        let weak = window.downgrade();
-        let next = next.clone();
-        move || {
-            if weak.upgrade().is_none() {
+            if ui.closed.get() {
                 return glib::ControlFlow::Break;
             }
-            for message in receive.try_iter().take(32) {
-                match message {
-                    Message::Scanned(result) => {
-                        busy.set(false);
-                        spinner.stop();
-                        scan.set_sensitive(true);
-                        next.set_sensitive(true);
-                        match result {
-                            Ok((found, fw)) => {
-                                disk_model.splice(0, disk_model.n_items(), &[]);
-                                disk_model.append("Select a disk — no device selected");
-                                for disk in &found {
-                                    disk_model.append(&format!(
-                                        "{} · {:.1} GiB · {}{}",
-                                        disk.identity.path,
-                                        disk.identity.bytes as f64 / 1024f64.powi(3),
-                                        disk.identity.model,
-                                        disk.blocked
-                                            .as_ref()
-                                            .map(|s| format!(" — unavailable: {s}"))
-                                            .unwrap_or_default()
-                                    ));
-                                }
-                                *disks.borrow_mut() = found;
-                                disks_menu.set_selected(0);
-                                firmware.set(fw);
-                                status.set_text("Ready. Select a disk to erase; mounted devices are unavailable.");
-                            }
-                            Err(e) => status.set_text(&e),
-                        }
-                    }
-                    Message::Reviewed(result) => {
-                        setup_page.set_sensitive(true);
-                        busy.set(false);
-                        spinner.stop();
-                        scan.set_sensitive(true);
-                        next.set_sensitive(true);
-                        match result {
-                            Ok(r) => {
-                                let desktop_names = r
-                                    .desktops()
-                                    .selected()
-                                    .iter()
-                                    .map(|d| d.label())
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                let application_names = r.applications().names();
-                                summary.set_text(&format!("ERASE ALL DATA ON {}\nModel: {} · Serial: {} · Size: {:.1} GiB\n\nDesktops: {}\nDefault session: {} · {:?} / {}\nHost: {} · User: {}\nLocale: {} · Time zone: {} · Keyboard: {}\nWi-Fi transfer: {} · {} saved profiles\nUnfree software: {}\nApplications: {}\n\nThe installation uses the media's pinned Determinate Nix flake. Root login is locked; your user can administer the system with sudo.\n\nType exactly: ERASE {}",r.disk().path,r.disk().model,r.disk().serial,r.disk().bytes as f64/1024f64.powi(3),desktop_names,r.desktops().default().label(),r.firmware(),r.filesystem().name(),r.hostname().as_str(),r.username().as_str(),r.locale(),r.timezone().as_str(),r.keyboard(),r.wifi().enabled(),r.wifi().profile_count(),r.allow_unfree(),if application_names.is_empty() { "None" } else { &application_names },r.disk().path));
-                                *pending.borrow_mut() = Some(*r);
-                                erase.set_text("");
-                                consent.set_active(false);
-                                install.set_sensitive(false);
-                                stack.set_visible_child_name("review");
-                                status.set_text(
-                                    "Nothing has been written. Confirm the device carefully.",
-                                );
-                            }
-                            Err(e) => status.set_text(&e),
-                        }
-                    }
-                    Message::Event(Event::Progress { step, message }) => {
-                        progress.set_fraction(step as f64 / 6.0);
-                        status.set_text(&message);
-                    }
-                    Message::Event(Event::Failed { message }) => {
-                        // Bounded display work even if a command emits a large log.
-                        let message: String = message.chars().take(6000).collect();
-                        failure_details.buffer().set_text(&message);
-                        failure_scroll.set_visible(true);
-                        status.set_text("Installation failed. See the details above; the disk may have been modified.");
-                    }
-                    Message::Event(Event::Complete) => {
-                        progress.set_fraction(1.0);
-                    }
-                    Message::Finished(result) => {
-                        busy.set(false);
-                        installing.set(false);
-                        spinner.stop();
-                        done.set_visible(true);
-                        progress_heading.set_text(if result.is_ok() {
-                            "Installation complete."
-                        } else {
-                            "Installation did not complete. See the details below."
-                        });
-                        match result {Ok(())=>status.set_text("Installation complete. Shut down the live system, remove the media and boot the installed disk."),Err(e)=>{if !status.text().starts_with("Installation failed."){status.set_text(&e);}}}
-                    }
-                    Message::Zone(generation, result) => {
-                        zone_running.set(false);
-                        zone_spinner.stop();
-                        detect.set_sensitive(true);
-                        if generation == zone_epoch.get() {
-                            match result {
-                                Ok(found) => {
-                                    timezone.set_text(found.zone.as_str());
-                                    zone_status.set_text(&found.explanation);
-                                }
-                                Err(error) => zone_status.set_text(&error),
-                            }
-                        } else {
-                            zone_status.set_text("Your manual choice was kept; the detection result was not applied.");
-                        }
-                    }
-                }
-            }
-            // Keep a visible activity indicator even when Location is not the
-            // selected tab while its worker is still detecting the time zone.
-            if busy.get() || zone_running.get() {
-                spinner.start();
-            } else {
-                spinner.stop();
+            for message in receive.try_iter().take(64) {
+                ui.handle(message);
             }
             glib::ControlFlow::Continue
         }
     });
-    window.present();
-    rescan();
-    detect_zone();
+    glib::timeout_add_local(Duration::from_millis(500), {
+        let ui = Rc::downgrade(&ui);
+        move || {
+            let Some(ui) = ui.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if let Some(started) = ui.started.get()
+                && ui.installing.get()
+            {
+                ui.install
+                    .elapsed
+                    .set_text(&clock(started.elapsed().as_secs()));
+            }
+            glib::ControlFlow::Continue
+        }
+    });
+    #[cfg(debug_assertions)]
+    if preview {
+        preview::resize(&ui.window);
+    }
+    ui.window.present();
+    #[cfg(debug_assertions)]
+    if preview {
+        preview::apply(&ui);
+    }
+}
+
+#[cfg(debug_assertions)]
+fn preview_requested() -> bool {
+    std::env::var_os("CALAMARES_UI_PREVIEW").is_some()
+}
+#[cfg(not(debug_assertions))]
+fn preview_requested() -> bool {
+    false
+}
+
+impl Ui {
+    fn toast(&self, text: &str) {
+        let toast = adw::Toast::new(text);
+        toast.set_timeout(6);
+        self.toasts.add_toast(toast);
+    }
+
+    fn connect(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        let with = move |f: fn(&Rc<Ui>)| {
+            let weak = weak.clone();
+            move || {
+                if let Some(ui) = weak.upgrade() {
+                    f(&ui);
+                }
+            }
+        };
+        self.next.connect_clicked({
+            let f = with(Ui::forward);
+            move |_| f()
+        });
+        self.back.connect_clicked({
+            let f = with(Ui::backward);
+            move |_| f()
+        });
+        self.sidebar.list.connect_row_activated({
+            let weak = Rc::downgrade(self);
+            move |_, row| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.jump(Step::ALL[row.index().max(0) as usize]);
+                }
+            }
+        });
+        self.disk.rescan.connect_clicked({
+            let f = with(Ui::rescan);
+            move |_| f()
+        });
+        self.disk.filesystem.connect_active_notify({
+            let f = with(Ui::update_layout);
+            move |_| f()
+        });
+        self.disk.swap.connect_active_notify({
+            let f = with(Ui::update_layout);
+            move |_| f()
+        });
+        for entry in [
+            self.account.full_name.upcast_ref::<gtk::Editable>(),
+            self.account.password.upcast_ref(),
+            self.account.repeat.upcast_ref(),
+            self.account.hostname.upcast_ref(),
+        ] {
+            entry.connect_changed({
+                let f = with(Ui::validate_account_live);
+                move |_| f()
+            });
+        }
+        self.account.full_name.connect_changed({
+            let weak = Rc::downgrade(self);
+            move |entry| {
+                if let Some(ui) = weak.upgrade()
+                    && !ui.username_edited.get()
+                {
+                    ui.filling_username.set(true);
+                    ui.account
+                        .username
+                        .set_text(&suggest_username(&entry.text()));
+                    ui.filling_username.set(false);
+                }
+            }
+        });
+        self.account.username.connect_changed({
+            let weak = Rc::downgrade(self);
+            move |entry| {
+                if let Some(ui) = weak.upgrade() {
+                    if !ui.filling_username.get() {
+                        ui.username_edited.set(!entry.text().is_empty());
+                    }
+                    ui.validate_account_live();
+                }
+            }
+        });
+        for card in &self.desktop.cards {
+            card.connect_toggled({
+                let weak = Rc::downgrade(self);
+                move |_| {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.sync_desktops();
+                        ui.schedule_warm();
+                    }
+                }
+            });
+        }
+        self.desktop.default.connect_selected_notify({
+            let weak = Rc::downgrade(self);
+            move |combo| {
+                if let Some(ui) = weak.upgrade()
+                    && !ui.updating_default.get()
+                {
+                    ui.default_choice.set(
+                        ui.default_desktops
+                            .borrow()
+                            .get(combo.selected() as usize)
+                            .copied(),
+                    );
+                }
+            }
+        });
+        self.location.timezone.connect_changed({
+            let weak = Rc::downgrade(self);
+            move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.zone_epoch.set(ui.zone_epoch.get().wrapping_add(1));
+                    ui.location.confirm.set_active(false);
+                }
+            }
+        });
+        self.location.detect.connect_clicked({
+            let f = with(Ui::detect_zone);
+            move |_| f()
+        });
+        self.location.internet.connect_active_notify({
+            let weak = Rc::downgrade(self);
+            move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.zone_epoch.set(ui.zone_epoch.get().wrapping_add(1));
+                }
+            }
+        });
+        self.review.erase.connect_changed({
+            let f = with(Ui::update_nav);
+            move |_| f()
+        });
+        self.review.consent.connect_toggled({
+            let f = with(Ui::update_nav);
+            move |_| f()
+        });
+        self.window.connect_close_request({
+            let weak = Rc::downgrade(self);
+            move |_| {
+                let Some(ui) = weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                if ui.installing.get() {
+                    ui.toast("The installer cannot be closed while it is writing to the disk.");
+                    return glib::Propagation::Stop;
+                }
+                ui.stop_warm();
+                // Dropping an unconfirmed session withdraws its request.
+                ui.session.borrow_mut().take();
+                ui.closed.set(true);
+                glib::Propagation::Proceed
+            }
+        });
+    }
+
+    // ---- Navigation -------------------------------------------------------
+
+    fn go(self: &Rc<Self>, step: Step) {
+        self.step.set(step);
+        if step > self.reached.get() {
+            self.reached.set(step);
+        }
+        self.stack.set_visible_child_name(step.name());
+        self.title.set_title(step.heading());
+        self.title.set_subtitle(&if step == Step::Welcome {
+            String::new()
+        } else {
+            format!("Step {} of {}", step.index(), Step::ALL.len() - 1)
+        });
+        self.split.set_show_content(true);
+        self.update_nav();
+    }
+
+    fn locked(&self) -> bool {
+        self.reviewing.get() || self.installing.get() || self.step.get() >= Step::Review
+    }
+
+    fn jump(self: &Rc<Self>, step: Step) {
+        if !self.locked() && step <= self.reached.get() && step <= Step::Location {
+            self.go(step);
+        } else {
+            self.update_nav();
+        }
+    }
+
+    fn update_nav(self: &Rc<Self>) {
+        let step = self.step.get();
+        let locked = self.locked();
+        let completed = self.completed.get();
+        for (index, (row, badge)) in self.sidebar.rows.iter().enumerate() {
+            let current = index == step.index() && !completed;
+            let done = index < step.index() || completed;
+            for (class, on) in [
+                ("step-current", current),
+                ("step-done", done && !current),
+                ("step-future", !done && !current),
+            ] {
+                if on {
+                    row.add_css_class(class);
+                } else {
+                    row.remove_css_class(class);
+                }
+            }
+            badge.set_text(&if done && !current {
+                "✓".to_string()
+            } else {
+                (index + 1).to_string()
+            });
+            row.set_sensitive(
+                current
+                    || (!locked
+                        && index <= self.reached.get().index()
+                        && index <= Step::Location.index()),
+            );
+        }
+        self.sidebar
+            .list
+            .select_row(Some(&self.sidebar.rows[step.index()].0));
+        let finished = self.completed.get() || (self.failed.get() && !self.installing.get());
+        self.back
+            .set_visible(step != Step::Welcome && step != Step::Install);
+        self.back.set_sensitive(!self.reviewing.get());
+        self.next.remove_css_class("suggested-action");
+        self.next.remove_css_class("destructive-action");
+        match step {
+            Step::Welcome => {
+                self.next.set_label("Get Started");
+                self.next.add_css_class("suggested-action");
+            }
+            Step::Location => {
+                self.next.set_label(if self.reviewing.get() {
+                    "Checking…"
+                } else {
+                    "Review"
+                });
+                self.next.add_css_class("suggested-action");
+            }
+            Step::Review => {
+                self.next.set_label("Erase Disk and Install");
+                self.next.add_css_class("destructive-action");
+            }
+            Step::Install => self.next.set_label("Close Installer"),
+            _ => {
+                self.next.set_label("Next");
+                self.next.add_css_class("suggested-action");
+            }
+        }
+        self.next
+            .set_visible(step != Step::Install || (finished && !self.completed.get()));
+        self.next.set_sensitive(match step {
+            Step::Review => self.confirmation_ready(),
+            Step::Install => finished,
+            _ => !self.reviewing.get(),
+        });
+        self.content.set_reveal_bottom_bars(!self.completed.get());
+        if step == Step::Install && self.installing.get() && !self.failed.get() {
+            self.activity_spinner.set_visible(false);
+            self.activity.set_text(
+                "Keep this computer on and connected to power until the installation finishes.",
+            );
+        } else if step == Step::Install {
+            self.activity.set_text("");
+        }
+    }
+
+    fn forward(self: &Rc<Self>) {
+        let result = match self.step.get() {
+            Step::Welcome => Ok(Step::Disk),
+            Step::Disk => self.check_disk().map(|()| Step::Account),
+            Step::Account => self.check_account().map(|()| Step::Desktop),
+            Step::Desktop => self.check_desktops().map(|()| Step::Applications),
+            Step::Applications => Ok(Step::Location),
+            Step::Location => {
+                self.start_review();
+                return;
+            }
+            Step::Review => {
+                self.confirm_install();
+                return;
+            }
+            Step::Install => {
+                self.window.close();
+                return;
+            }
+        };
+        match result {
+            Ok(step) => self.go(step),
+            Err(message) => self.toast(&message),
+        }
+    }
+
+    fn backward(self: &Rc<Self>) {
+        match self.step.get() {
+            Step::Welcome | Step::Install => {}
+            Step::Review => {
+                // Withdraw the unconfirmed request; nothing was written.
+                self.session.borrow_mut().take();
+                self.generation.set(self.generation.get() + 1);
+                self.go(Step::Location);
+                self.schedule_warm();
+            }
+            step => self.go(Step::ALL[step.index() - 1]),
+        }
+    }
+
+    // ---- Disk -------------------------------------------------------------
+
+    fn rescan(self: &Rc<Self>) {
+        if self.scanning.replace(true) {
+            return;
+        }
+        self.disk.spinner.set_visible(true);
+        self.disk.rescan.set_sensitive(false);
+        let send = self.send.clone();
+        thread::spawn(move || {
+            let result = disk::discover()
+                .map(|d| (d, Firmware::current()))
+                .map_err(|e| format!("{e:#}"));
+            let _ = send.send(Message::Scanned(result));
+        });
+    }
+
+    fn read_memory(&self) {
+        let send = self.send.clone();
+        thread::spawn(move || {
+            let _ = send.send(Message::Memory(
+                memory::read().map_err(|e| format!("{e:#}")),
+            ));
+        });
+    }
+
+    fn show_disks(self: &Rc<Self>, found: Vec<Disk>, firmware: Firmware) {
+        for row in self.disk.rows.borrow_mut().drain(..) {
+            self.disk.group.remove(&row);
+        }
+        self.selected_disk.set(None);
+        self.firmware.set(firmware);
+        let mut first: Option<CheckButton> = None;
+        let mut rows = Vec::new();
+        for (index, disk) in found.iter().enumerate() {
+            let identity = &disk.identity;
+            let model = if identity.model.is_empty() {
+                "Unknown disk"
+            } else {
+                identity.model.as_str()
+            };
+            let row = adw::ActionRow::builder().title(model).build();
+            row.set_use_markup(false);
+            let image = icon(disk_icon(&identity.path));
+            image.set_pixel_size(24);
+            let serial = if identity.serial.is_empty() {
+                String::new()
+            } else {
+                format!(" · serial {}", identity.serial)
+            };
+            match &disk.blocked {
+                Some(reason) => {
+                    row.set_subtitle(&format!(
+                        "{} · {} — {reason}",
+                        identity.path,
+                        size(identity.bytes)
+                    ));
+                    row.add_prefix(&image);
+                    row.add_suffix(&badge("Unavailable", "unavailable"));
+                    row.set_sensitive(false);
+                }
+                None => {
+                    row.set_subtitle(&format!(
+                        "{} · {}{serial}",
+                        identity.path,
+                        size(identity.bytes)
+                    ));
+                    let check = CheckButton::new();
+                    check.set_valign(Align::Center);
+                    if let Some(first) = &first {
+                        check.set_group(Some(first));
+                    } else {
+                        first = Some(check.clone());
+                    }
+                    check.connect_toggled({
+                        let weak = Rc::downgrade(self);
+                        move |check| {
+                            if let Some(ui) = weak.upgrade()
+                                && check.is_active()
+                            {
+                                ui.selected_disk.set(Some(index));
+                                ui.update_layout();
+                            }
+                        }
+                    });
+                    // Prefixes are prepended: the radio ends up first.
+                    row.add_prefix(&image);
+                    row.add_prefix(&check);
+                    row.set_activatable_widget(Some(&check));
+                }
+            }
+            self.disk.group.add(&row);
+            rows.push(row);
+        }
+        if found.is_empty() {
+            let row = adw::ActionRow::builder()
+                .title("No disks found")
+                .subtitle("Connect a disk, then rescan.")
+                .build();
+            self.disk.group.add(&row);
+            rows.push(row);
+        }
+        *self.disk.rows.borrow_mut() = rows;
+        *self.disks.borrow_mut() = found;
+        self.update_layout();
+    }
+
+    fn selected_filesystem(&self) -> Filesystem {
+        Filesystem::ALL
+            .get(self.disk.filesystem.active() as usize)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn swap_bytes(&self) -> Option<u64> {
+        self.disk
+            .swap
+            .is_active()
+            .then(|| self.memory.get().map(|m| memory::swap_bytes(m.total)))
+            .flatten()
+    }
+
+    fn update_layout(self: &Rc<Self>) {
+        let filesystem = self.selected_filesystem();
+        self.disk
+            .filesystem_row
+            .set_subtitle(match filesystem {
+                Filesystem::Ext4 => "General purpose and the most widely used Linux filesystem (default).",
+                Filesystem::Btrfs => "Checksums and zstd compression on a single root volume. Snapshots are not configured.",
+                Filesystem::Xfs => "High-performance journaling for large files and parallel I/O.",
+            });
+        self.disk.swap.set_subtitle(&match self.memory.get() {
+            Some(info) => format!(
+                "A {} swap partition matching installed memory. zswap compresses pages in RAM before they reach the disk, and hibernation can resume from it.",
+                size(memory::swap_bytes(info.total))
+            ),
+            None => "Matches installed memory. zswap compresses pages in RAM before they reach the disk, and hibernation can resume from it.".into(),
+        });
+        let disks = self.disks.borrow();
+        let Some(disk) = self.selected_disk.get().and_then(|i| disks.get(i)) else {
+            self.disk
+                .layout
+                .clear("Select a disk to preview its new partitions.");
+            return;
+        };
+        if self.disk.swap.is_active() && self.memory.get().is_none() {
+            self.disk.layout.clear("Reading installed memory…");
+            return;
+        }
+        match Layout::new(disk.identity.bytes, self.firmware.get(), self.swap_bytes()) {
+            Ok(layout) => self
+                .disk
+                .layout
+                .show(&layout, self.firmware.get(), filesystem),
+            Err(error) => self.disk.layout.clear(&format!("⚠ {error:#}")),
+        }
+    }
+
+    fn check_disk(&self) -> Result<(), String> {
+        let disks = self.disks.borrow();
+        let disk = self
+            .selected_disk
+            .get()
+            .and_then(|i| disks.get(i))
+            .ok_or("Select the disk to erase. No disk is selected automatically.")?;
+        if let Some(reason) = &disk.blocked {
+            return Err(reason.clone());
+        }
+        if self.disk.swap.is_active() && self.memory.get().is_none() {
+            return Err("Still reading installed memory; try again in a moment.".into());
+        }
+        Layout::new(disk.identity.bytes, self.firmware.get(), self.swap_bytes())
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    // ---- Account ----------------------------------------------------------
+
+    fn account_errors(&self) -> Vec<(&adw::EntryRow, String)> {
+        let a = &self.account;
+        let mut errors = Vec::new();
+        let full_name = a.full_name.text();
+        if full_name.len() > 128
+            || full_name.contains(':')
+            || full_name.chars().any(char::is_control)
+        {
+            errors.push((&a.full_name, "The full name cannot contain a colon or control characters, and is limited to 128 bytes.".to_string()));
+        }
+        if let Err(e) = Username::parse(&a.username.text()) {
+            errors.push((&a.username, e.to_string()));
+        }
+        let password = a.password.text();
+        if password.chars().count() < 12
+            || password.len() > 1024
+            || password.chars().any(char::is_control)
+        {
+            errors.push((
+                a.password.upcast_ref(),
+                "The password needs at least 12 characters and no control characters.".into(),
+            ));
+        } else if password != a.repeat.text() {
+            errors.push((a.repeat.upcast_ref(), "The passwords do not match.".into()));
+        }
+        if let Err(e) = Hostname::parse(&a.hostname.text()) {
+            errors.push((&a.hostname, e.to_string()));
+        }
+        errors
+    }
+
+    /// Mark fields that already contain invalid text, without nagging about
+    /// fields the user has not reached yet.
+    fn validate_account_live(self: &Rc<Self>) {
+        let a = &self.account;
+        let errors = self.account_errors();
+        for row in [
+            &a.full_name,
+            &a.username,
+            a.password.upcast_ref::<adw::EntryRow>(),
+            a.repeat.upcast_ref(),
+            &a.hostname,
+        ] {
+            let bad = !row.text().is_empty() && errors.iter().any(|(r, _)| *r == row);
+            if bad {
+                row.add_css_class("error");
+            } else {
+                row.remove_css_class("error");
+            }
+        }
+        let length = a.password.text().chars().count();
+        a.password_hint.set_text(&if length == 0 {
+            "Use at least 12 characters. Passwords are typed with this live session's keyboard layout.".to_string()
+        } else if length < 12 {
+            format!("{} more characters needed. Passwords are typed with this live session's keyboard layout.", 12 - length)
+        } else if a.password.text() != a.repeat.text() {
+            "Long enough. Now confirm it in the second field.".to_string()
+        } else {
+            "✓ Password set. Passwords are typed with this live session's keyboard layout.".to_string()
+        });
+    }
+
+    fn check_account(&self) -> Result<(), String> {
+        match self.account_errors().into_iter().next() {
+            Some((row, message)) => {
+                row.add_css_class("error");
+                row.grab_focus();
+                Err(message)
+            }
+            None => Ok(()),
+        }
+    }
+
+    // ---- Desktops ---------------------------------------------------------
+
+    fn selected_desktops(&self) -> Vec<Desktop> {
+        Desktop::ALL
+            .iter()
+            .zip(&self.desktop.cards)
+            .filter_map(|(desktop, card)| card.is_active().then_some(*desktop))
+            .collect()
+    }
+
+    fn sync_desktops(&self) {
+        let selected = self.selected_desktops();
+        self.updating_default.set(true);
+        let labels: Vec<&str> = selected.iter().map(|d| d.label()).collect();
+        self.desktop
+            .default_model
+            .splice(0, self.desktop.default_model.n_items(), &labels);
+        let index = self
+            .default_choice
+            .get()
+            .and_then(|choice| selected.iter().position(|d| *d == choice))
+            .unwrap_or(0);
+        self.desktop.default.set_selected(if selected.is_empty() {
+            gtk::INVALID_LIST_POSITION
+        } else {
+            index as u32
+        });
+        self.desktop.default.set_sensitive(selected.len() > 1);
+        if self
+            .default_choice
+            .get()
+            .is_none_or(|c| !selected.contains(&c))
+        {
+            self.default_choice.set(selected.first().copied());
+        }
+        *self.default_desktops.borrow_mut() = selected.clone();
+        self.updating_default.set(false);
+        self.desktop.conflict.set_visible(
+            selected.contains(&Desktop::Gnome) && selected.contains(&Desktop::Cinnamon),
+        );
+    }
+
+    fn check_desktops(&self) -> Result<(), String> {
+        let selected = self.selected_desktops();
+        if selected.is_empty() {
+            return Err("Select at least one desktop environment.".into());
+        }
+        if selected.contains(&Desktop::Gnome) && selected.contains(&Desktop::Cinnamon) {
+            return Err(
+                "GNOME and Cinnamon cannot be installed together. Deselect one of them.".into(),
+            );
+        }
+        Ok(())
+    }
+
+    // ---- Time zone --------------------------------------------------------
+
+    fn detect_zone(self: &Rc<Self>) {
+        self.zone_running.set(true);
+        self.zone_epoch.set(self.zone_epoch.get().wrapping_add(1));
+        let generation = self.zone_epoch.get();
+        let internet = self.location.internet.is_active();
+        self.location.spinner.set_visible(true);
+        self.location.detect.set_sensitive(false);
+        self.location
+            .status
+            .set_text("Detecting the time zone… you can still enter it yourself.");
+        let send = self.send.clone();
+        thread::spawn(move || {
+            let result = Settings::load()
+                .and_then(|s| timezone::detect(std::path::Path::new(&s.zoneinfo), internet))
+                .map_err(|e| format!("{e:#}"));
+            let _ = send.send(Message::Zone(generation, result));
+        });
+    }
+
+    // ---- Speculative caching ----------------------------------------------
+
+    fn stop_warm(&self) {
+        if let Some(timer) = self.warm_timer.borrow_mut().take() {
+            timer.remove();
+        }
+        if let Some(cancel) = self.warm_cancel.borrow_mut().take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.warm_generation.set(self.warm_generation.get() + 1);
+        self.activity_spinner.set_visible(false);
+        self.activity.set_text("");
+    }
+
+    /// Warm the page cache with the media's reference closures for the
+    /// current selection, a couple of seconds after it stops changing.
+    fn schedule_warm(self: &Rc<Self>) {
+        if self.step.get() >= Step::Review || self.reviewing.get() {
+            return;
+        }
+        self.stop_warm();
+        let weak = Rc::downgrade(self);
+        let timer = glib::timeout_add_local_once(Duration::from_secs(2), move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.warm_timer.borrow_mut().take();
+                ui.start_warm();
+            }
+        });
+        *self.warm_timer.borrow_mut() = Some(timer);
+    }
+
+    fn start_warm(self: &Rc<Self>) {
+        let desktops = self.selected_desktops();
+        let applications = self.apps.selected_ids();
+        let cancel = Arc::new(AtomicBool::new(false));
+        *self.warm_cancel.borrow_mut() = Some(cancel.clone());
+        let generation = self.warm_generation.get();
+        let send = self.send.clone();
+        thread::spawn(move || {
+            let lists = precache::reference_lists(&desktops, &applications);
+            let outcome = if lists.is_empty() {
+                Ok(precache::Outcome::default())
+            } else {
+                precache::read_lists(&lists).and_then(|paths| {
+                    precache::warm(&paths, &cancel, |read, total| {
+                        // Progress is advisory: never block the warmer on a full channel.
+                        let _ = send.try_send(Message::Warm {
+                            generation,
+                            read,
+                            total,
+                            done: false,
+                        });
+                    })
+                })
+            };
+            let (read, total) = outcome.map(|o| (o.bytes, o.total)).unwrap_or((0, 0));
+            let _ = send.send(Message::Warm {
+                generation,
+                read,
+                total,
+                done: true,
+            });
+        });
+    }
+
+    // ---- Review -----------------------------------------------------------
+
+    fn start_review(self: &Rc<Self>) {
+        if self.reviewing.get() {
+            return;
+        }
+        let checks = [
+            self.check_disk(),
+            self.check_account(),
+            self.check_desktops(),
+        ];
+        let targets = [Step::Disk, Step::Account, Step::Desktop];
+        for (check, step) in checks.into_iter().zip(targets) {
+            if let Err(message) = check {
+                self.go(step);
+                self.toast(&message);
+                return;
+            }
+        }
+        if !self.location.confirm.is_active() {
+            self.toast("Check the time zone and confirm it before continuing.");
+            return;
+        }
+        let Some(disk) = self
+            .selected_disk
+            .get()
+            .and_then(|i| self.disks.borrow().get(i).cloned())
+        else {
+            self.go(Step::Disk);
+            return;
+        };
+        let request = RawRequest {
+            confirmation: String::new(),
+            disk: disk.identity,
+            firmware: self.firmware.get(),
+            filesystem: self.selected_filesystem(),
+            hostname: self.account.hostname.text().into(),
+            username: self.account.username.text().into(),
+            full_name: self.account.full_name.text().into(),
+            password: self.account.password.text().into(),
+            locale: LOCALES
+                .get(self.location.locale.selected() as usize)
+                .unwrap_or(&LOCALES[0])
+                .to_string(),
+            timezone: self.location.timezone.text().trim().into(),
+            keyboard: KEYBOARDS
+                .get(self.location.keyboard.selected() as usize)
+                .unwrap_or(&KEYBOARDS[0])
+                .to_string(),
+            desktops: self.selected_desktops(),
+            default_desktop: self.default_choice.get().unwrap_or(Desktop::Plasma),
+            applications: self.apps.selected_ids(),
+            copy_wifi: self.desktop.wifi.is_active(),
+            wifi_profiles: vec![],
+            allow_unfree: self.desktop.unfree.is_active(),
+            swap: self.disk.swap.is_active(),
+            tuning: self.disk.tuning.is_active(),
+        };
+        self.stop_warm();
+        self.reviewing.set(true);
+        self.generation.set(self.generation.get() + 1);
+        let generation = self.generation.get();
+        self.activity_spinner.set_visible(true);
+        self.activity.set_text("Checking your settings…");
+        self.update_nav();
+        let send = self.send.clone();
+        thread::spawn(move || {
+            let result = (|| -> anyhow::Result<(Box<Review>, Session)> {
+                let plan = request.parse(&Settings::load()?)?;
+                disk::revalidate(plan.disk())?;
+                let plan = plan.snapshot_wifi()?;
+                let review = Box::new(Review::of(&plan));
+                let events = send.clone();
+                let session = Session::start(plan, move |update| {
+                    let _ = events.send(Message::Session(generation, update));
+                })?;
+                Ok((review, session))
+            })()
+            .map_err(|e| format!("{e:#}"));
+            let _ = send.send(Message::Reviewed(generation, result));
+        });
+    }
+
+    fn show_review(self: &Rc<Self>, review: &Review) {
+        let r = &self.review;
+        let disk = &review.disk;
+        let model = if disk.model.is_empty() {
+            "the selected disk"
+        } else {
+            disk.model.as_str()
+        };
+        r.erase_title
+            .set_text(&format!("Everything on {model} will be erased"));
+        r.erase_detail.set_text(&format!(
+            "{} · {}{} — all partitions and data on this disk will be destroyed.",
+            disk.path,
+            size(disk.bytes),
+            if disk.serial.is_empty() {
+                String::new()
+            } else {
+                format!(" · serial {}", disk.serial)
+            }
+        ));
+        r.disk
+            .set_subtitle(&format!("{model} · {} · {}", disk.path, size(disk.bytes)));
+        let swap = review
+            .swap
+            .then(|| self.memory.get().map(|m| memory::swap_bytes(m.total)))
+            .flatten();
+        r.partitions
+            .set_subtitle(&match Layout::new(disk.bytes, review.firmware, swap) {
+                Ok(layout) => {
+                    let mut parts = vec![
+                        if review.firmware == Firmware::Uefi {
+                            "EFI 1.0 GiB".to_string()
+                        } else {
+                            "BIOS boot 2 MiB".to_string()
+                        },
+                        format!("NixOS {}", size(layout.root_bytes())),
+                    ];
+                    if let Some(bytes) = layout.swap_bytes() {
+                        parts.push(format!("swap {} with zswap", size(bytes)));
+                    }
+                    parts.join(" · ")
+                }
+                Err(error) => format!("{error:#}"),
+            });
+        r.filesystem.set_subtitle(&format!(
+            "{}{}",
+            review.filesystem.name(),
+            if review.filesystem == Filesystem::Btrfs {
+                " with zstd compression"
+            } else {
+                ""
+            }
+        ));
+        r.boot.set_subtitle(match review.firmware {
+            Firmware::Uefi => "UEFI with systemd-boot",
+            Firmware::Bios => "Legacy BIOS with GRUB",
+        });
+        r.desktops.set_subtitle(
+            &review
+                .desktops
+                .iter()
+                .map(|d| d.label())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        r.session.set_subtitle(review.default_desktop.label());
+        r.applications
+            .set_subtitle(if review.applications.is_empty() {
+                "None"
+            } else {
+                &review.applications
+            });
+        r.tuning.set_subtitle(if review.tuning {
+            "CachyOS-inspired defaults"
+        } else {
+            "NixOS defaults"
+        });
+        r.unfree.set_subtitle(if review.unfree {
+            "Allowed"
+        } else {
+            "Not allowed (redistributable firmware is still included)"
+        });
+        r.wifi.set_subtitle(&if review.wifi {
+            match review.wifi_profiles {
+                1 => "1 saved network will be copied".to_string(),
+                n => format!("{n} saved networks will be copied"),
+            }
+        } else {
+            "Not copied".to_string()
+        });
+        r.computer.set_subtitle(&review.hostname);
+        r.user.set_subtitle(&if review.full_name.is_empty() {
+            review.username.clone()
+        } else {
+            format!("{} ({})", review.full_name, review.username)
+        });
+        r.locale.set_subtitle(&review.locale);
+        r.zone.set_subtitle(&review.timezone);
+        r.keyboard.set_subtitle(&review.keyboard);
+        let phrase = format!("ERASE {}", disk.path);
+        r.erase.set_title(&format!("Type {phrase} to confirm"));
+        *self.phrase.borrow_mut() = phrase;
+        r.erase.set_text("");
+        r.consent.set_active(false);
+        self.prepared.set(false);
+        self.prep_failed.set(false);
+        self.set_preparation(
+            PrepState::Working,
+            "Waiting for authorization…",
+            "The installation helper repeats every safety check before any disk write.",
+        );
+        r.prep_bar.set_visible(false);
+        r.prep_failure.set_visible(false);
+    }
+
+    fn confirmation_ready(&self) -> bool {
+        self.review.consent.is_active()
+            && !self.prep_failed.get()
+            && self.session.borrow().is_some()
+            && !self.phrase.borrow().is_empty()
+            && self.review.erase.text() == *self.phrase.borrow()
+    }
+
+    fn set_preparation(&self, state: PrepState, title: &str, subtitle: &str) {
+        let r = &self.review;
+        r.prep_row.set_title(title);
+        r.prep_row.set_subtitle(subtitle);
+        r.prep_spinner.set_visible(state == PrepState::Working);
+        r.prep_icon.set_visible(state != PrepState::Working);
+        r.prep_icon.set_icon_name(Some(match state {
+            PrepState::Failed => "dialog-error-symbolic",
+            _ => "object-select-symbolic",
+        }));
+        for class in ["success-icon", "error-icon"] {
+            r.prep_icon.remove_css_class(class);
+        }
+        r.prep_icon.add_css_class(if state == PrepState::Failed {
+            "error-icon"
+        } else {
+            "success-icon"
+        });
+    }
+
+    fn prepared_text(summary: &Summary) -> (String, String) {
+        if summary.deferred {
+            return (
+                "Ready to install".into(),
+                format!(
+                    "The selection needs more downloads than fit in memory, so the system will be built on the new disk after formatting. This takes longer. Prepared in {}.",
+                    duration(summary.seconds)
+                ),
+            );
+        }
+        let cached = if summary.cache_limited {
+            format!(
+                "{} of it cached in memory (limited to keep memory free)",
+                size(summary.cached_bytes)
+            )
+        } else {
+            "fully cached in memory".to_string()
+        };
+        (
+            "Ready to install".into(),
+            format!(
+                "The {} system is built and {cached}. Prepared in {}.",
+                size(summary.closure_bytes),
+                duration(summary.seconds)
+            ),
+        )
+    }
+
+    // ---- Installation -----------------------------------------------------
+
+    fn confirm_install(self: &Rc<Self>) {
+        if !self.confirmation_ready() {
+            self.toast("Type the exact phrase and confirm that the disk will be erased.");
+            return;
+        }
+        let phrase = self.phrase.borrow().clone();
+        match self.session.borrow().as_ref() {
+            Some(session) => session.confirm(&phrase),
+            None => {
+                self.toast(
+                    "The installation helper is no longer running. Go back and review again.",
+                );
+                return;
+            }
+        }
+        self.account.password.set_text("");
+        self.account.repeat.set_text("");
+        self.installing.set(true);
+        self.started.set(Some(Instant::now()));
+        self.install_step.set(0);
+        self.copy_fraction.set(0.0);
+        self.install.elapsed.set_text("0:00");
+        self.install.bar.set_fraction(0.0);
+        self.install.message.set_text(if self.prepared.get() {
+            "Starting the installation…"
+        } else {
+            "Finishing preparation; the installation starts as soon as it is ready."
+        });
+        self.install.stack.set_visible_child_name("progress");
+        self.go(Step::Install);
+    }
+
+    fn set_install_step(&self, step: u8) {
+        for (index, (_, state, _)) in self.install.steps.iter().enumerate() {
+            let number = index as u8 + 1;
+            state.set_visible_child_name(if number < step {
+                "done"
+            } else if number == step {
+                "current"
+            } else {
+                "pending"
+            });
+        }
+        self.install_step.set(step);
+        self.install
+            .bar
+            .set_fraction(overall_fraction(step, self.copy_fraction.get()));
+    }
+
+    fn append_log(&self, line: &str) {
+        let buffer = self.install.log.buffer();
+        let mut end = buffer.end_iter();
+        buffer.insert(&mut end, line);
+        buffer.insert(&mut end, "\n");
+        let lines = self.log_lines.get() + 1;
+        // Bounded display work, even when Nix reports thousands of paths.
+        if lines > 400 {
+            let mut start = buffer.start_iter();
+            if let Some(mut cut) = buffer.iter_at_line(100) {
+                buffer.delete(&mut start, &mut cut);
+            }
+            self.log_lines.set(lines - 100);
+        } else {
+            self.log_lines.set(lines);
+        }
+        buffer.place_cursor(&buffer.end_iter());
+        self.install.log.scroll_mark_onscreen(&buffer.get_insert());
+    }
+
+    fn show_failure(self: &Rc<Self>, message: &str) {
+        let message: String = message.chars().take(8000).collect();
+        if self.installing.get() || self.step.get() == Step::Install {
+            self.failed.set(true);
+            if let Some(started) = self.started.take() {
+                self.install
+                    .elapsed
+                    .set_text(&clock(started.elapsed().as_secs()));
+            }
+            self.install.heading.set_text("Installation Failed");
+            self.install.failure_text.buffer().set_text(&message);
+            self.install.failure.set_visible(true);
+            self.install
+                .message
+                .set_text("Installation failed. See the details below.");
+            if let Some((_, state, _)) = self
+                .install
+                .steps
+                .get(usize::from(self.install_step.get().max(1)) - 1)
+            {
+                state.set_visible_child_name("failed");
+            }
+        } else {
+            self.prep_failed.set(true);
+            self.set_preparation(
+                PrepState::Failed,
+                "Preparation failed",
+                "No disk was written. Go back to change your choices, or copy the details below.",
+            );
+            self.review.prep_bar.set_visible(false);
+            self.review.prep_failure_text.buffer().set_text(&message);
+            self.review.prep_failure.set_visible(true);
+            self.review.prep_failure.set_expanded(true);
+        }
+        self.update_nav();
+    }
+
+    fn show_done(self: &Rc<Self>) {
+        self.installing.set(false);
+        self.completed.set(true);
+        self.set_install_step(7);
+        self.install.bar.set_fraction(1.0);
+        let seconds = self.total_seconds.get().or_else(|| {
+            self.started
+                .get()
+                .map(|started| started.elapsed().as_secs_f64())
+        });
+        let time = seconds
+            .map(|s| format!("Installed in <b>{}</b>. ", duration(s)))
+            .unwrap_or_default();
+        self.title.set_title("Installation Complete");
+        self.title.set_subtitle("");
+        self.install.done.set_description(Some(&format!(
+            "{time}Remove the installation media, then restart into your new system."
+        )));
+        let buttons = gtk::Box::new(Orientation::Horizontal, 12);
+        buttons.set_halign(Align::Center);
+        let restart = gtk::Button::with_label("Restart Now");
+        restart.add_css_class("pill");
+        restart.add_css_class("suggested-action");
+        let close = gtk::Button::with_label("Close");
+        close.add_css_class("pill");
+        buttons.append(&close);
+        buttons.append(&restart);
+        restart.connect_clicked({
+            let send = self.send.clone();
+            move |button| {
+                button.set_sensitive(false);
+                let send = send.clone();
+                thread::spawn(move || {
+                    let result = std::process::Command::new("systemctl")
+                        .arg("reboot")
+                        .status()
+                        .map_err(|e| e.to_string())
+                        .and_then(|status| {
+                            if status.success() {
+                                Ok(())
+                            } else {
+                                Err(format!("systemctl reboot failed ({status})"))
+                            }
+                        });
+                    let _ = send.send(Message::Rebooted(result));
+                });
+            }
+        });
+        close.connect_clicked({
+            let window = self.window.clone();
+            move |_| window.close()
+        });
+        self.install.done.set_child(Some(&buttons));
+        self.install.stack.set_visible_child_name("done");
+        self.update_nav();
+    }
+
+    // ---- Messages ---------------------------------------------------------
+
+    fn handle(self: &Rc<Self>, message: Message) {
+        match message {
+            Message::Scanned(result) => {
+                self.scanning.set(false);
+                self.disk.spinner.set_visible(false);
+                self.disk.rescan.set_sensitive(true);
+                match result {
+                    Ok((found, firmware)) => self.show_disks(found, firmware),
+                    Err(error) => self.toast(&format!("Could not list disks: {error}")),
+                }
+            }
+            Message::Memory(result) => match result {
+                Ok(info) => {
+                    self.memory.set(Some(info));
+                    self.update_layout();
+                }
+                Err(error) => {
+                    self.disk.swap.set_active(false);
+                    self.toast(&format!("Could not read installed memory: {error}"));
+                }
+            },
+            Message::Reviewed(generation, result) => {
+                if generation != self.generation.get() {
+                    return; // Dropping a stale session cancels it.
+                }
+                self.reviewing.set(false);
+                self.activity_spinner.set_visible(false);
+                self.activity.set_text("");
+                match result {
+                    Ok((review, session)) => {
+                        *self.session.borrow_mut() = Some(session);
+                        self.show_review(&review);
+                        self.go(Step::Review);
+                    }
+                    Err(error) => {
+                        self.update_nav();
+                        self.toast(&error);
+                        self.schedule_warm();
+                    }
+                }
+            }
+            Message::Session(generation, update) => {
+                if generation == self.generation.get() {
+                    self.session_update(update);
+                }
+            }
+            Message::Zone(generation, result) => {
+                self.zone_running.set(false);
+                self.location.spinner.set_visible(false);
+                self.location.detect.set_sensitive(true);
+                if generation == self.zone_epoch.get() {
+                    match result {
+                        Ok(found) => {
+                            self.location.timezone.set_text(found.zone.as_str());
+                            self.location.status.set_text(&found.explanation);
+                        }
+                        Err(error) => self.location.status.set_text(&error),
+                    }
+                } else {
+                    self.location.status.set_text(
+                        "Your manual choice was kept; the detection result was not applied.",
+                    );
+                }
+            }
+            Message::Warm {
+                generation,
+                read,
+                total,
+                done,
+            } => {
+                if generation != self.warm_generation.get() {
+                    return;
+                }
+                self.activity_spinner.set_visible(!done && total > 0);
+                self.activity.set_text(&if total == 0 {
+                    String::new()
+                } else if done {
+                    format!("{} of selected software cached in memory", size(read))
+                } else {
+                    format!(
+                        "Caching selected software in memory · {} of {}",
+                        size(read),
+                        size(total)
+                    )
+                });
+            }
+            Message::Rebooted(result) => {
+                if let Err(error) = result {
+                    self.toast(&format!("Could not restart: {error}"));
+                }
+            }
+        }
+    }
+
+    fn session_update(self: &Rc<Self>, update: Update) {
+        let installing = self.installing.get();
+        match update {
+            Update::Event(Event::Preparing { message }) => {
+                if installing && self.install_step.get() == 0 {
+                    self.install
+                        .message
+                        .set_text(&format!("Finishing preparation: {message}"));
+                } else if !self.prep_failed.get() {
+                    self.set_preparation(PrepState::Working, &message, "");
+                }
+                self.append_log(&message);
+            }
+            Update::Event(Event::Log { line }) => {
+                if !installing && !self.prepared.get() && !self.prep_failed.get() {
+                    self.review.prep_row.set_subtitle(&line);
+                }
+                self.append_log(&line);
+            }
+            Update::Event(Event::Timing { stage, seconds }) => {
+                if stage == "install" {
+                    self.total_seconds.set(Some(seconds));
+                }
+                self.append_log(&format!("{stage}: {seconds:.1} s"));
+            }
+            Update::Event(Event::Caching { read, total }) => {
+                if !installing {
+                    self.review.prep_bar.set_visible(total > 0);
+                    if total > 0 {
+                        self.review
+                            .prep_bar
+                            .set_fraction(read as f64 / total as f64);
+                    }
+                    self.review.prep_row.set_subtitle(&format!(
+                        "{} of {} read into memory",
+                        size(read),
+                        size(total)
+                    ));
+                }
+            }
+            Update::Event(Event::Prepared { summary }) => {
+                self.prepared.set(true);
+                let (title, subtitle) = Self::prepared_text(&summary);
+                self.set_preparation(PrepState::Done, &title, &subtitle);
+                self.review.prep_bar.set_visible(false);
+                if installing && self.install_step.get() == 0 {
+                    self.install
+                        .message
+                        .set_text("Preparation complete. Starting the installation…");
+                }
+                self.append_log(&subtitle);
+                self.update_nav();
+            }
+            Update::Event(Event::Progress { step, message }) => {
+                self.install.message.set_text(&message);
+                self.set_install_step(step);
+                self.append_log(&message);
+            }
+            Update::Event(Event::Copying { bytes, total }) => {
+                if total > 0 {
+                    self.copy_fraction.set(bytes as f64 / total as f64);
+                    self.install.bar.set_fraction(overall_fraction(
+                        self.install_step.get().max(4),
+                        self.copy_fraction.get(),
+                    ));
+                    if let Some((row, _, _)) = self.install.steps.get(3) {
+                        row.set_subtitle(&format!("{} of {}", size(bytes.min(total)), size(total)));
+                    }
+                }
+            }
+            Update::Event(Event::Complete) => self.show_done(),
+            Update::Event(Event::Cancelled) => {
+                if !installing {
+                    self.set_preparation(
+                        PrepState::Failed,
+                        "Preparation cancelled",
+                        "Nothing was written. Go back and review again to continue.",
+                    );
+                }
+            }
+            Update::Event(Event::Failed { message }) => self.show_failure(&message),
+            Update::Finished(result) => {
+                self.session.borrow_mut().take();
+                let was_installing = self.installing.replace(false);
+                if self.completed.get() {
+                    return;
+                }
+                if was_installing || self.step.get() == Step::Install {
+                    if !self.failed.get() {
+                        self.show_failure(&result.err().unwrap_or_else(|| {
+                            "The installation helper exited without confirming completion.".into()
+                        }));
+                    }
+                } else if !self.prep_failed.get() {
+                    self.show_failure(&result.err().unwrap_or_else(|| {
+                        "The installation helper stopped before the installation was confirmed."
+                            .into()
+                    }));
+                }
+                self.update_nav();
+            }
+        }
+    }
+}
+
+type Callback = Rc<dyn Fn()>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrepState {
+    Working,
+    Done,
+    Failed,
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[test]
-    fn placeholder_never_selects_a_disk() {
-        assert_eq!(super::disk_index(0, 2), None);
-        assert_eq!(super::disk_index(1, 2), Some(0));
-        assert_eq!(super::disk_index(2, 2), Some(1));
-        assert_eq!(super::disk_index(3, 2), None);
-        assert_eq!(super::disk_index(u32::MAX, 2), None);
+    fn usernames_are_suggested_only_when_valid() {
+        assert_eq!(suggest_username("Ada Lovelace"), "ada");
+        assert_eq!(suggest_username("  Grace  Hopper "), "grace");
+        assert_eq!(suggest_username("Ünal"), "nal");
+        assert_eq!(suggest_username("2pac"), "");
+        assert_eq!(suggest_username("root"), "");
+        assert_eq!(suggest_username(""), "");
+    }
+    #[test]
+    fn progress_is_monotonic_and_copy_dominates() {
+        let mut last = 0.0;
+        for step in 1..=6 {
+            for copy in [0.0, 0.5, 1.0] {
+                let fraction = overall_fraction(step, if step == 4 { copy } else { 0.0 });
+                assert!(fraction >= last);
+                last = fraction;
+            }
+        }
+        assert!((STEP_WEIGHTS.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+        assert!(overall_fraction(4, 1.0) - overall_fraction(4, 0.0) > 0.5);
+    }
+    #[test]
+    fn steps_have_unique_names() {
+        let names: std::collections::BTreeSet<_> = Step::ALL.iter().map(|s| s.name()).collect();
+        assert_eq!(names.len(), Step::ALL.len());
+        assert_eq!(LOCALE_NAMES.len(), LOCALES.len());
+        assert_eq!(KEYBOARD_NAMES.len(), KEYBOARDS.len());
     }
 }

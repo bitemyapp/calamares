@@ -7,7 +7,11 @@ pkgs.rustPlatform.buildRustPackage {
     fileset = pkgs.lib.fileset.unions [
       ../rust/Cargo.toml
       ../rust/Cargo.lock
+      ../rust/build.rs
+      ../rust/data
+      ../rust/reference.nix
       ../rust/src
+      ../rust/system
     ];
   };
   cargoLock.lockFile = ../rust/Cargo.lock;
@@ -17,8 +21,12 @@ pkgs.rustPlatform.buildRustPackage {
   ];
   buildInputs = [
     pkgs.gtk4
+    pkgs.libadwaita
     pkgs.networkmanager
   ];
+  # Adwaita symbolic icons and the NixOS logo, independent of the live
+  # desktop's icon theme. Referenced store paths stay runtime dependencies.
+  CALAMARES_ICON_PATH = "${pkgs.adwaita-icon-theme}/share/icons:${pkgs.nixos-icons}/share/icons";
   CALAMARES_CA_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
   # Privileged children use only this build-time path, never the invoking user's.
   CALAMARES_TOOL_PATH =

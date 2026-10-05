@@ -1,6 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::*;
 use desktop::DesktopSelection;
+use filesystem::Identities;
+const ROOT: &str = "11111111-2222-4333-8444-555555555555";
+const SWAP: &str = "66666666-7777-4888-9999-aaaaaaaaaaaa";
+/// Fixed identities matching a plan's firmware and swap choice.
+fn ids(plan: &InstallPlan) -> Identities {
+    Identities {
+        root: ROOT.into(),
+        efi: (plan.firmware() == Firmware::Uefi).then(|| "A1B2-C3D4".into()),
+        swap: plan.swap().then(|| SWAP.into()),
+    }
+}
+fn render(plan: &InstallPlan) -> String {
+    config::configuration(plan, &ids(plan)).unwrap()
+}
 fn fixture() -> (tempfile::TempDir, Settings, RawRequest) {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("Etc")).unwrap();
@@ -36,6 +50,8 @@ fn fixture() -> (tempfile::TempDir, Settings, RawRequest) {
         copy_wifi: false,
         wifi_profiles: vec![],
         allow_unfree: false,
+        swap: true,
+        tuning: true,
         confirmation: "ERASE /dev/vda".into(),
     };
     (dir, settings, request)
@@ -64,12 +80,12 @@ fn review_and_confirmation_are_distinct_transitions() {
 fn ipc_downgrades_to_raw_and_helper_parses_again() {
     let (_dir, settings, raw) = fixture();
     let plan = raw.parse(&settings).unwrap();
-    let expected = config::configuration(&plan);
+    let expected = render(&plan);
     let wire = plan.confirm("ERASE /dev/vda").unwrap().into_request();
     let json = zeroize::Zeroizing::new(serde_json::to_vec(&wire).unwrap());
     let received: RawRequest = serde_json::from_slice(&json).unwrap();
     let confirmed = received.parse_confirmed(&settings).unwrap();
-    assert_eq!(config::configuration(&confirmed.into_plan()), expected);
+    assert_eq!(render(&confirmed.into_plan()), expected);
     // A well-formed wire object is not trusted just because a GUI produced it.
     let mut received: RawRequest = serde_json::from_slice(&json).unwrap();
     received.disk.path = "/dev/sda".into();
@@ -88,12 +104,12 @@ fn application_choices_survive_review_and_privileged_reparsing() {
         plan.applications().ids(),
         ["codex", "build-tools", "rustup"]
     );
-    let expected = config::configuration(&plan);
+    let expected = render(&plan);
     let wire = plan.confirm("ERASE /dev/vda").unwrap().into_request();
     let encoded = serde_json::to_vec(&wire).unwrap();
     let received: RawRequest = serde_json::from_slice(&encoded).unwrap();
     let parsed = received.parse_confirmed(&settings).unwrap().into_plan();
-    assert_eq!(config::configuration(&parsed), expected);
+    assert_eq!(render(&parsed), expected);
     assert!(
         expected.contains("calamares.applications = [ \"codex\" \"build-tools\" \"rustup\" ];")
     );
@@ -127,7 +143,7 @@ fn omitted_applications_preserve_old_requests_but_empty_means_none() {
 #[test]
 fn every_desktop_subset_and_default_obeys_the_contract() {
     let mut supported = 0;
-    for bits in 0u8..64 {
+    for bits in 0u16..256 {
         let selected: Vec<_> = Desktop::ALL
             .iter()
             .enumerate()
@@ -145,9 +161,10 @@ fn every_desktop_subset_and_default_obeys_the_contract() {
             }
         }
     }
-    assert_eq!(supported, 47);
+    // All nonempty subsets of eight desktops, less those with GNOME and Cinnamon.
+    assert_eq!(supported, 255 - 64);
     assert!(DesktopSelection::parse(vec![Desktop::Plasma; 2], Desktop::Plasma).is_err());
-    assert!(DesktopSelection::parse(vec![Desktop::Plasma; 7], Desktop::Plasma).is_err());
+    assert!(DesktopSelection::parse(vec![Desktop::Plasma; 9], Desktop::Plasma).is_err());
 }
 
 #[test]
@@ -156,12 +173,9 @@ fn single_desktop_configs_keep_selected_session() {
         let (_dir, settings, mut raw) = fixture();
         raw.desktops = vec![desktop];
         raw.default_desktop = desktop;
-        let text = config::configuration(&raw.parse(&settings).unwrap());
-        assert!(text.contains(&format!("{}.enable = true;", desktop.option())));
-        assert!(text.contains(&format!("defaultSession = \"{}\"", desktop.session())));
-        if desktop != Desktop::Plasma {
-            assert!(!text.contains("services.desktopManager.plasma6.enable"));
-        }
+        let text = render(&raw.parse(&settings).unwrap());
+        assert!(text.contains(&format!("calamares.desktops = [ \"{}\" ];", desktop.id())));
+        assert!(text.contains(&format!("calamares.defaultDesktop = \"{}\";", desktop.id())));
         assert!(text.contains("networking.networkmanager.enable = true;"));
         assert!(text.contains("hardware.enableRedistributableFirmware = true;"));
         assert!(!text.contains("networking.wireless.enable = false"));
@@ -172,14 +186,14 @@ fn single_desktop_configs_keep_selected_session() {
 fn unfree_default_is_enabled_but_explicit_opt_out_survives() {
     let (_dir, settings, mut raw) = fixture();
     raw.allow_unfree = DEFAULT_ALLOW_UNFREE;
-    let text = config::configuration(&raw.parse(&settings).unwrap());
+    let text = render(&raw.parse(&settings).unwrap());
     assert!(text.contains("nixpkgs.config.allowUnfree = true;"));
     let (_dir, settings, mut raw) = fixture();
     raw.allow_unfree = false;
     let plan = raw.parse(&settings).unwrap();
     let wire = plan.confirm("ERASE /dev/vda").unwrap().into_request();
     let confirmed = wire.parse_confirmed(&settings).unwrap();
-    let text = config::configuration(&confirmed.into_plan());
+    let text = render(&confirmed.into_plan());
     assert!(text.contains("nixpkgs.config.allowUnfree = false;"));
     assert!(text.contains("hardware.enableRedistributableFirmware = true;"));
 }
@@ -290,7 +304,7 @@ fn wifi_opt_out_and_empty_snapshot_are_different_states() {
 fn config_contains_no_password_and_no_test_services() {
     let (_dir, settings, raw) = fixture();
     let secret = raw.password.clone();
-    let text = config::configuration(&raw.parse(&settings).unwrap());
+    let text = render(&raw.parse(&settings).unwrap());
     assert!(!text.contains(&secret));
     assert!(!text.contains("qemuGuest"));
     assert!(text.contains("hashedPasswordFile = \"/etc/nixos-secrets/"));
@@ -311,7 +325,7 @@ fn plan_keeps_settings_used_at_parse_and_wire_cannot_inject_them() {
     let plan = raw.parse(&settings).unwrap();
     settings.kernel = Kernel::Lts;
     settings.test_diagnostics = false;
-    let text = config::configuration(&plan);
+    let text = render(&plan);
     assert!(text.contains("grub.device = \"/dev/vda\""));
     assert!(text.contains("linuxPackages_latest"));
     assert!(text.contains("qemuGuest.enable = true"));
@@ -328,22 +342,81 @@ fn hashing_authenticates_only_correct_password() {
 }
 
 #[test]
-fn installed_configuration_requires_uuid_identities_for_the_reviewed_firmware() {
-    let root = "11111111-2222-3333-4444-555555555555";
+fn configuration_requires_identities_for_the_reviewed_firmware_and_swap() {
     for filesystem in Filesystem::ALL {
         for firmware in [Firmware::Uefi, Firmware::Bios] {
-            let (_dir, settings, mut raw) = fixture();
-            raw.filesystem = filesystem;
-            raw.firmware = firmware;
-            let plan = raw.parse(&settings).unwrap();
-            let boot = (firmware == Firmware::Uefi).then_some("A1B2-C3D4");
-            assert!(config::installed_configuration(&plan, root, boot).is_ok());
-            assert!(config::installed_configuration(&plan, "A1B2-C3D4", boot).is_err());
-            assert!(config::installed_configuration(&plan, root, Some(root)).is_err());
-            let mismatched_boot = (firmware == Firmware::Bios).then_some("A1B2-C3D4");
-            assert!(config::installed_configuration(&plan, root, mismatched_boot).is_err());
+            for swap in [true, false] {
+                let (_dir, settings, mut raw) = fixture();
+                raw.filesystem = filesystem;
+                raw.firmware = firmware;
+                raw.swap = swap;
+                let plan = raw.parse(&settings).unwrap();
+                let good = ids(&plan);
+                let text = config::configuration(&plan, &good).unwrap();
+                assert!(text.contains(&format!(
+                    "device = lib.mkForce \"/dev/disk/by-uuid/{ROOT}\""
+                )));
+                assert!(text.contains(&format!("fsType = \"{}\"", filesystem.name())));
+                assert!(text.contains("\"noatime\""));
+                assert_eq!(
+                    text.contains("/dev/disk/by-uuid/A1B2-C3D4"),
+                    firmware == Firmware::Uefi
+                );
+                assert_eq!(
+                    text.contains(&format!(
+                        "boot.resumeDevice = \"/dev/disk/by-uuid/{SWAP}\";"
+                    )),
+                    swap
+                );
+                assert_eq!(text.contains("calamares.zswap.enable = true;"), swap);
+                assert_eq!(text.contains("swapDevices = lib.mkForce [ ];"), !swap);
+                for bad in [
+                    Identities {
+                        root: "A1B2-C3D4".into(),
+                        ..good.clone()
+                    },
+                    Identities {
+                        efi: good.efi.is_none().then(|| "A1B2-C3D4".into()),
+                        ..good.clone()
+                    },
+                    Identities {
+                        swap: good.swap.is_none().then(|| SWAP.into()),
+                        ..good.clone()
+                    },
+                    Identities {
+                        efi: good.efi.as_ref().map(|_| ROOT.into()),
+                        ..good.clone()
+                    },
+                ] {
+                    if bad != good {
+                        assert!(config::configuration(&plan, &bad).is_err());
+                    }
+                }
+            }
         }
     }
+}
+
+#[test]
+fn swap_and_tuning_choices_survive_ipc_and_default_on_for_old_requests() {
+    let (_dir, settings, mut raw) = fixture();
+    raw.swap = false;
+    raw.tuning = false;
+    let plan = raw.parse(&settings).unwrap();
+    assert!(render(&plan).contains("calamares.tuning.enable = false;"));
+    let wire = plan.into_request();
+    assert!(wire.confirmation.is_empty());
+    let received: RawRequest = serde_json::from_slice(&serde_json::to_vec(&wire).unwrap()).unwrap();
+    let plan = received.parse(&settings).unwrap();
+    assert!(!plan.swap() && !plan.tuning());
+    let (_dir, settings, raw) = fixture();
+    let mut value = serde_json::to_value(&raw).unwrap();
+    value.as_object_mut().unwrap().remove("swap");
+    value.as_object_mut().unwrap().remove("tuning");
+    let old: RawRequest = serde_json::from_value(value).unwrap();
+    let plan = old.parse(&settings).unwrap();
+    assert!(plan.swap() && plan.tuning());
+    assert!(render(&plan).contains("calamares.tuning.enable = true;"));
 }
 
 #[test]
@@ -354,7 +427,7 @@ fn filesystem_choice_survives_review_confirmation_and_ipc() {
         let plan = raw.parse(&settings).unwrap();
         assert_eq!(plan.filesystem(), filesystem);
         assert_eq!(
-            config::configuration(&plan).contains("compress=zstd"),
+            render(&plan).contains("compress=zstd"),
             filesystem == Filesystem::Btrfs
         );
         let wire = plan.confirm("ERASE /dev/vda").unwrap().into_request();

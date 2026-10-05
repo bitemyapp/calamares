@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! NixOS option semantics adapted from calamares-nixos-extensions 0.3.23.
 //! No Python/C++ module or global-storage hooks are executed by this installer.
-use crate::{Desktop, Filesystem, Firmware, Hostname, InstallPlan, Kernel, Settings, read_trusted};
+use crate::{
+    Firmware, Hostname, InstallPlan, Kernel, Settings, filesystem::Identities, read_trusted,
+};
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeSet, fs, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
 
@@ -12,6 +14,10 @@ pub fn nix_string(value: &str) -> String {
         .expect("string serialization")
         .replace("${", "\\${")
 }
+
+// Static NixOS modules from rust/system, embedded by build.rs and copied into
+// /etc/nixos/calamares so the installed flake stays self-contained.
+include!(concat!(env!("OUT_DIR"), "/system_files.rs"));
 
 pub struct Template {
     pub flake: String,
@@ -81,43 +87,34 @@ impl Template {
             dir.join("applications.nix"),
             crate::applications::NIX_MODULE,
         )?;
+        let system = dir.join("calamares");
+        for (name, bytes) in SYSTEM_FILES {
+            let path = system.join(name);
+            fs::create_dir_all(path.parent().context("System module path")?)?;
+            fs::write(path, bytes)?;
+        }
         Ok(())
     }
 }
 
-pub fn configuration(request: &InstallPlan) -> String {
-    render_configuration(request, "")
-}
-
-/// Pin the freshly probed identities instead of trusting hardware detection's
-/// choice among potentially stale /dev/disk/by-uuid aliases.
-pub fn installed_configuration(
-    request: &InstallPlan,
-    root_uuid: &str,
-    boot_uuid: Option<&str>,
-) -> Result<String> {
-    crate::filesystem::check_uuid(root_uuid, request.filesystem().name())?;
-    ensure!(
-        boot_uuid.is_some() == (request.firmware() == Firmware::Uefi),
-        "EFI filesystem identity does not match the reviewed firmware"
-    );
-    let mut devices = format!(
-        "  # Use UUIDs read directly from the newly formatted filesystems.\n  fileSystems.\"/\".device = lib.mkForce {};\n",
-        nix_string(&format!("/dev/disk/by-uuid/{root_uuid}"))
-    );
-    if let Some(uuid) = boot_uuid {
-        crate::filesystem::check_uuid(uuid, "vfat")?;
-        devices.push_str(&format!(
-            "  fileSystems.\"/boot\".device = lib.mkForce {};\n",
-            nix_string(&format!("/dev/disk/by-uuid/{uuid}"))
-        ));
-    }
-    Ok(render_configuration(request, &devices))
-}
-
-fn render_configuration(request: &InstallPlan, filesystem_devices: &str) -> String {
+/// The installed system's configuration.nix. Filesystem identities are chosen
+/// before erasure, requested when formatting and verified from each superblock,
+/// so the complete system can be built while nothing has been written yet.
+/// They are pinned with mkForce: hardware detection run later must not select
+/// an obsolete /dev/disk/by-uuid alias.
+pub fn configuration(request: &InstallPlan, ids: &Identities) -> Result<String> {
     let settings = request.settings();
     let q = nix_string;
+    let by_uuid = |uuid: &str| q(&format!("/dev/disk/by-uuid/{uuid}"));
+    crate::filesystem::check_uuid(&ids.root, request.filesystem().name())?;
+    ensure!(
+        ids.efi.is_some() == (request.firmware() == Firmware::Uefi),
+        "EFI filesystem identity does not match the reviewed firmware"
+    );
+    ensure!(
+        ids.swap.is_some() == request.swap(),
+        "Swap identity does not match the reviewed choice"
+    );
     let boot = match request.firmware() {
         Firmware::Uefi => "boot.loader.systemd-boot.enable = true;\n  boot.loader.efi.canTouchEfiVariables = true;".into(),
         Firmware::Bios => format!("boot.loader.grub.enable = true;\n  boot.loader.grub.device = {};\n  boot.loader.grub.useOSProber = false;", q(&request.disk().path)),
@@ -126,56 +123,61 @@ fn render_configuration(request: &InstallPlan, filesystem_devices: &str) -> Stri
         Kernel::Latest => "  boot.kernelPackages = pkgs.linuxPackages_latest;\n",
         Kernel::Lts => "",
     };
-    // Upstream hardware detection preserves Btrfs subvolumes, but not compression.
-    let filesystem_options = if request.filesystem() == Filesystem::Btrfs {
-        "  fileSystems.\"/\".options = [ \"compress=zstd\" ];\n"
-    } else {
-        ""
-    };
+    let mut storage = format!(
+        "  fileSystems.\"/\" = {{\n    device = lib.mkForce {};\n    fsType = {};\n    options = [ {} ];\n  }};\n",
+        by_uuid(&ids.root),
+        q(request.filesystem().name()),
+        request
+            .filesystem()
+            .mount_options()
+            .iter()
+            .map(|o| q(o))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    if let Some(serial) = &ids.efi {
+        crate::filesystem::check_uuid(serial, "vfat")?;
+        storage.push_str(&format!(
+            "  fileSystems.\"/boot\" = {{\n    device = lib.mkForce {};\n    fsType = \"vfat\";\n    options = [ \"fmask=0077\" \"dmask=0077\" ];\n  }};\n",
+            by_uuid(serial)
+        ));
+    }
+    match &ids.swap {
+        Some(uuid) => {
+            crate::filesystem::check_uuid(uuid, "swap")?;
+            storage.push_str(&format!(
+                "  # Swap partition matched to installed RAM, also used to resume from hibernation.\n  swapDevices = lib.mkForce [ {{ device = {0}; }} ];\n  boot.resumeDevice = {0};\n  calamares.zswap.enable = true;\n",
+                by_uuid(uuid)
+            ));
+        }
+        None => storage.push_str("  swapDevices = lib.mkForce [ ];\n"),
+    }
     let diagnostic = if settings.test_diagnostics {
         "  # Disposable QEMU verification only.\n  services.qemuGuest.enable = true;\n  boot.kernelParams = [ \"console=ttyS0,115200n8\" \"console=tty0\" ];\n"
     } else {
         ""
     };
-    let desktops = request
-        .desktops()
-        .selected()
-        .iter()
-        .map(|desktop| format!("  {}.enable = true;\n", desktop.option()))
-        .collect::<String>();
-    let default_session = q(request.desktops().default().session());
-    let display_manager = if request.desktops().selected() == [Desktop::Gnome] {
-        "gdm"
-    } else {
-        "sddm"
-    };
-    // Multiple desktops set equally-prioritized defaults for these options.
-    // Resolve the shared helpers explicitly, while portals remain per-session.
-    let helpers = if request.desktops().contains(Desktop::Plasma) {
-        "  programs.ssh.askPassword = \"${pkgs.kdePackages.ksshaskpass}/bin/ksshaskpass\";\n  programs.gnupg.agent.pinentryPackage = pkgs.pinentry-qt;\n"
-    } else {
-        "  programs.ssh.askPassword = \"${pkgs.x11_ssh_askpass}/libexec/x11-ssh-askpass\";\n  programs.gnupg.agent.pinentryPackage = pkgs.pinentry-gnome3;\n"
-    };
-    format!(
+    let list = |items: Vec<String>| items.iter().map(|i| q(i)).collect::<Vec<_>>().join(" ");
+    Ok(format!(
         r#"# Generated by the NixOS-focused Rust Calamares installer.
 {{ config, lib, pkgs, ... }}: {{
-  imports = [ ./hardware-configuration.nix ./applications.nix ];
+  imports = [ ./hardware-configuration.nix ./applications.nix ./calamares ];
   calamares.installUser = {username};
   calamares.applications = [ {applications} ];
+  calamares.desktops = [ {desktops} ];
+  calamares.defaultDesktop = {default_desktop};
+  # CachyOS-inspired kernel, memory, I/O and service defaults: calamares/tuning.nix.
+  calamares.tuning.enable = {tuning};
   {boot}
-{kernel}{filesystem_options}{filesystem_devices}  networking.hostName = {hostname};
+{kernel}{storage}  networking.hostName = {hostname};
   networking.networkmanager.enable = true;
   # Include redistributable device firmware even when additional unfree
   # packages are declined. This is not a strictly free-software-only system.
   hardware.enableRedistributableFirmware = true;
   time.timeZone = {timezone};
   i18n.defaultLocale = {locale};
-  services.xserver.enable = true;
   services.xserver.xkb.layout = {keyboard};
   console.useXkbConfig = true;
-  services.displayManager.{display_manager}.enable = true;
-  services.displayManager.defaultSession = {default_session};
-{desktops}{helpers}  # Each desktop contributes its own session-specific portal configuration.
   services.printing.enable = true;
   security.rtkit.enable = true;
   services.pipewire = {{ enable = true; alsa.enable = true; alsa.support32Bit = true; pulse.enable = true; }};
@@ -193,13 +195,17 @@ fn render_configuration(request: &InstallPlan, filesystem_devices: &str) -> Stri
 {diagnostic}}}
 "#,
         hostname = q(request.hostname().as_str()),
-        applications = request
-            .applications()
-            .ids()
-            .iter()
-            .map(|id| q(id))
-            .collect::<Vec<_>>()
-            .join(" "),
+        applications = list(request.applications().ids()),
+        desktops = list(
+            request
+                .desktops()
+                .selected()
+                .iter()
+                .map(|d| d.id().to_owned())
+                .collect()
+        ),
+        default_desktop = q(request.desktops().default().id()),
+        tuning = request.tuning(),
         timezone = q(request.timezone().as_str()),
         locale = q(request.locale()),
         keyboard = q(request.keyboard()),
@@ -207,7 +213,7 @@ fn render_configuration(request: &InstallPlan, filesystem_devices: &str) -> Stri
         full_name = q(request.full_name()),
         unfree = request.allow_unfree(),
         state = q(&settings.state_version)
-    )
+    ))
 }
 
 pub fn write_secret(path: &Path, hash: &str) -> Result<()> {
@@ -241,6 +247,87 @@ mod tests {
             )
             .is_err()
         );
+    }
+    /// The installation media prebuild rust/reference.nix so installations
+    /// find their packages already present. Settings that affect which
+    /// packages an installed system contains must match between the two.
+    #[test]
+    fn reference_system_shares_closure_relevant_settings() {
+        let squash = |text: &str| text.split_whitespace().collect::<String>();
+        let reference = squash(include_str!("../reference.nix"));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Etc")).unwrap();
+        std::fs::write(dir.path().join("Etc/UTC"), "TZif").unwrap();
+        let settings = Settings {
+            template_dir: "/unused".into(),
+            zoneinfo: dir.path().to_string_lossy().into_owned(),
+            state_version: "26.11".into(),
+            kernel: Kernel::Latest,
+            test_diagnostics: false,
+        };
+        let plan = crate::RawRequest {
+            disk: crate::disk::Identity {
+                path: "/dev/vda".into(),
+                major_minor: "252:0".into(),
+                bytes: 64 * 1024u64.pow(3),
+                serial: "test".into(),
+                wwn: "".into(),
+                model: "test".into(),
+            },
+            firmware: Firmware::Uefi,
+            filesystem: crate::Filesystem::Ext4,
+            hostname: "nixos".into(),
+            username: "alice".into(),
+            full_name: "".into(),
+            password: "long-enough-test-password".into(),
+            locale: "en_US.UTF-8".into(),
+            timezone: "Etc/UTC".into(),
+            keyboard: "us".into(),
+            desktops: vec![crate::Desktop::Plasma],
+            default_desktop: crate::Desktop::Plasma,
+            applications: crate::applications::default_selection(),
+            copy_wifi: false,
+            wifi_profiles: vec![],
+            allow_unfree: true,
+            swap: true,
+            tuning: true,
+            confirmation: String::new(),
+        }
+        .parse(&settings)
+        .unwrap();
+        let ids = Identities {
+            root: "00000000-0000-4000-8000-000000000000".into(),
+            efi: Some("0000-0000".into()),
+            swap: Some("00000000-0000-4000-8000-000000000001".into()),
+        };
+        let generated = squash(&configuration(&plan, &ids).unwrap());
+        for fragment in [
+            "calamares.applications=",
+            "calamares.desktops=",
+            "calamares.tuning.enable=",
+            "boot.loader.systemd-boot.enable=true;",
+            "boot.loader.efi.canTouchEfiVariables=true;",
+            "pkgs.linuxPackages_latest",
+            "options=[\"fmask=0077\"\"dmask=0077\"];",
+            "calamares.zswap.enable=",
+            "networking.networkmanager.enable=true;",
+            "hardware.enableRedistributableFirmware=true;",
+            "console.useXkbConfig=true;",
+            "services.printing.enable=true;",
+            "security.rtkit.enable=true;",
+            "enable=true;alsa.enable=true;alsa.support32Bit=true;pulse.enable=true;",
+            "users.mutableUsers=true;",
+            "users.users.root.initialHashedPassword=\"!\";",
+            "extraGroups=[\"networkmanager\"\"wheel\"];",
+            "hashedPasswordFile=\"/etc/nixos-secrets/user-password.hash\";",
+            "nixpkgs.config.allowUnfree=true;",
+        ] {
+            assert!(generated.contains(fragment), "config.rs lacks {fragment}");
+            assert!(
+                reference.contains(fragment),
+                "reference.nix lacks {fragment}"
+            );
+        }
     }
     #[test]
     fn secrets_are_exclusive_and_private() {

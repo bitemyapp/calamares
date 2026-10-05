@@ -14,9 +14,16 @@ The new implementation is GPL-3.0-or-later. It has no upstream endorsement.
 
 - x86_64 NixOS live ISO; network connection required. The live desktop is Plasma.
 - Multi-select installed desktops: Plasma (default), GNOME, Xfce, Cinnamon,
-  MATE and LXQt, with an explicit default login session. GNOME and Cinnamon
-  cannot be combined because the pinned NixOS modules conflict on GSettings.
+  MATE, LXQt, vanilla Hyprland and an Omarchy-style Hyprland, with an explicit
+  default login session. GNOME and Cinnamon cannot be combined because the
+  pinned NixOS modules conflict on GSettings.
 - Guided erase of one whole disk, GPT, ext4 (default), Btrfs or XFS, EFI/systemd-boot or BIOS/GRUB.
+- A swap partition matched to installed RAM, with zswap and hibernation resume
+  (default on), and CachyOS-inspired kernel, memory, I/O and service defaults
+  (default on). Both are reviewed choices with an opt-out.
+- The installed system is evaluated, built and cached in RAM while the user
+  reviews the plan. After the typed confirmation the installer only partitions,
+  formats, copies the prepared system and installs the bootloader.
 - Hostname, normal user with sudo, password, full name, time zone, a selection
   of eight system locales and keyboard layouts. Allowing unfree packages is
   enabled by default, with an explicit checkbox opt-out and review summary.
@@ -38,17 +45,24 @@ subvolume layout are not configured. UEFI always gets a separate FAT32 ESP.
 Older JSON requests default to ext4; unknown filesystem names are rejected.
 
 Before erasure the helper checks the selected formatter and live-kernel support.
-It holds the whole-device lock through partitioning and formatting, checks the
-kernel's partition parent/number/geometry, wipes signatures inside the new
-partitions, and verifies each format with uncached `blkid --probe`. It releases
-the lock before triggering/waiting for udev, then mounts with an explicit type.
-This avoids relying on stale filesystem detection after overwriting a used disk.
-The helper also probes the new root and EFI filesystem UUIDs directly from their
-superblocks. It pins those device paths in `configuration.nix` with `lib.mkForce`:
-hardware detection can otherwise select an obsolete `/dev/disk/by-uuid` alias
-that still points to the reformatted partition. Waiting for udev alone does not
-prove that every old alias has disappeared. Missing, duplicate or malformed UUID
-probe data fails installation before the system build.
+It chooses the new filesystem identities itself: random UUIDs for root and swap
+and a FAT serial for the ESP. Hardware detection runs with
+`nixos-generate-config --no-filesystems`, and `configuration.nix` declares the
+filesystems and swap by those identities, pinned with `lib.mkForce`. Hardware
+detection run later can therefore never select an obsolete
+`/dev/disk/by-uuid` alias. Choosing identities first is what allows the complete
+system to be built before anything is written.
+
+The GPT layout is ESP (EFI) or a BIOS boot partition, then root, then optional
+swap at the end, created by a single `parted` invocation with exact MiB
+boundaries. The helper holds the whole-device lock through partitioning and
+formatting. It checks the kernel's partition count, parents, numbers and exact
+geometry, and wipes signatures inside the new partitions. Each formatter is
+given the chosen identity; uncached `blkid --probe` must then report the
+expected type **and** that exact identity, otherwise installation stops. The
+lock is released before triggering udev (udev postpones events for locked
+disks), then filesystems are mounted with an explicit type and `noatime`
+(Btrfs also uses `compress=zstd:1`).
 Failures preserve bounded storage/kernel diagnostics in a root-only
 `/run/calamares-storage-*.log`; copy that file before rebooting. The GUI displays
 scrollable, selectable failure details.
@@ -112,6 +126,53 @@ authorization and helper communication run on workers; hashing, downloads,
 partitioning and installation run in the privileged Rust helper. The UI shows
 an active spinner throughout work. No shell command is assembled from user
 input by the installer.
+
+### Preparation before confirmation
+
+The GUI starts the helper as soon as review succeeds, using the `session`
+protocol (`src/session.rs`). The protocol is newline-delimited JSON on stdin:
+first the reviewed plan without a confirmation, later at most one
+confirmation line. While the user reads the summary and types the erase phrase,
+the helper prepares without writing to any disk (`install::prepare`):
+
+1. Repeats the live-media, firmware, user and disk checks and filesystem
+   preflight, then takes the installer lock.
+2. Computes the RAM-matched swap size (`MemTotal` rounded up to whole GiB) and
+   the exact partition layout. A disk too small for the root minimum fails here.
+3. Chooses filesystem identities, detects hardware and writes the complete
+   target flake into a root-only staging directory.
+4. Runs one `nix build --dry-run --json`. That evaluates the system and reports
+   how much must be downloaded.
+5. Builds the system in the live store if the unpacked downloads fit in
+   available memory less a reserve. Otherwise it defers the build to the target
+   store after formatting, which is slower but never exhausts the RAM-backed
+   live store.
+6. Checks the root partition against the closure size plus 8 GiB.
+7. Warms the page cache with the whole closure (`precache.rs`). It reads at most
+   the memory available at the start less a reserve, and drops the compressed
+   squashfs pages behind it, so the later copy is not limited by the USB stick.
+
+Closing stdin before confirming cancels preparation (`Event::Cancelled`):
+running Nix commands are killed and nothing was written. The confirmation line
+is checked by the helper against its own parsed plan (`InstallPlan::confirm`);
+only the resulting `ConfirmedInstall` can be executed. `install::execute`
+re-renders the configuration from the confirmed plan and requires it to equal
+the prepared one. It then partitions, formats with the chosen identities, writes
+files, copies the closure and installs the bootloader with
+`nixos-install --system`.
+
+The closure is copied with `nix copy --no-check-sigs` from the live store.
+A direct parallel file copy with database registration was measured and
+removed: it was slower in VMs (48.0 s against 30.5 s click-to-complete) and on
+the host. The helper reports each stage's duration as `Event::Timing`, the GUI
+shows the installation time, and `/var/log/calamares-nixos/install.json` on the
+installed system keeps the stage timings and preparation summary for
+measurements on real hardware.
+
+The GUI separately warms the page cache while the user is still choosing. Two
+seconds after desktop or application choices settle, it reads the store paths
+listed in `/iso/calamares/closures/` for the selection. The installation media
+generate those lists from prebuilt reference systems (`reference.nix`).
 
 `calamares-nixos-helper` accepts a strict JSON request on stdin. The GUI starts
 it through NixOS's setuid Polkit wrapper, using a policy restricted to this
@@ -244,12 +305,14 @@ catalog and module are copied into `/etc/nixos` with the selected IDs in
 `configuration.nix`; installed versions and store paths are recorded in
 `/etc/installer-applications.json`. Terminal applications receive menu launchers.
 
-Before the first disk write, the helper builds and roots the selected package
-closure, checks its size, and reserves an additional 24 GiB for the operating
-system and installation workspace. Failure at this stage leaves disk contents
-unchanged. The integrated ISO caches the complete catalog in its read-only store
-so application preparation does not require downloading a large closure into
-live-session RAM. This does not make the complete OS installation offline.
+Before the first disk write, the helper builds the complete installed system,
+including the selected applications, and checks that the root partition holds
+its closure plus 8 GiB of headroom. Failure at this stage leaves disk contents
+unchanged. The integrated ISO caches the complete catalog and a prebuilt system
+for every desktop in its read-only store, so preparation normally downloads
+almost nothing into live-session RAM. Selections whose downloads would not fit
+in memory are built on the target store after formatting instead. This does not
+make the complete OS installation offline.
 
 Application test runs may use an 80 GiB image in addition to the original 40 GiB
 image. Both require the exact `RESPIN_TEST_ONLY` serial and expected VM device

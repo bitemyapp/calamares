@@ -8,7 +8,10 @@ let
       fileset = pkgs.lib.fileset.unions [
         ../rust/Cargo.toml
         ../rust/Cargo.lock
+        ../rust/build.rs
+        ../rust/reference.nix
         ../rust/src
+        ../rust/system
       ];
     };
     cargoLock.lockFile = ../rust/Cargo.lock;

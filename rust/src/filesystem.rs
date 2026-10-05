@@ -41,8 +41,17 @@ impl Filesystem {
             Ok(fs::read_to_string("/proc/filesystems")?)
         })
     }
-    pub(crate) fn format(self, device: &str) -> Result<()> {
-        format_with(self, device, output)
+    /// Options for both the installation mount and the installed system.
+    /// noatime avoids a metadata write per read; zstd level 1 keeps Btrfs
+    /// compression cheap enough for installation and interactive use.
+    pub fn mount_options(self) -> &'static [&'static str] {
+        match self {
+            Self::Btrfs => &["noatime", "compress=zstd:1"],
+            Self::Ext4 | Self::Xfs => &["noatime"],
+        }
+    }
+    pub(crate) fn format(self, device: &str, uuid: &str) -> Result<()> {
+        format_with(self, device, uuid, output)
             .with_context(|| format!("Formatting {device} as {}", self.name()))
     }
     pub(crate) fn mount(self, device: &str, target: &str) -> Result<()> {
@@ -50,14 +59,67 @@ impl Filesystem {
             self.name(),
             device,
             target,
-            if self == Self::Btrfs {
-                "compress=zstd"
-            } else {
-                "defaults"
-            },
+            &self.mount_options().join(","),
             output,
         )
     }
+}
+
+/// Filesystem identities chosen before the first disk write. Formatting
+/// requests them explicitly and probing must return exactly these values, so
+/// the complete target configuration can be evaluated and built before
+/// erasure without ever trusting a stale /dev/disk/by-uuid alias.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identities {
+    pub root: String,
+    /// FAT volume serial in blkid's display form, e.g. `1A2B-3C4D`.
+    pub efi: Option<String>,
+    pub swap: Option<String>,
+}
+impl Identities {
+    pub fn generate(firmware: Firmware, swap: bool) -> Result<Self> {
+        Ok(Self {
+            root: uuid_v4(random()?),
+            efi: if firmware == Firmware::Uefi {
+                Some(vfat_serial(random()?))
+            } else {
+                None
+            },
+            swap: if swap { Some(uuid_v4(random()?)) } else { None },
+        })
+    }
+}
+
+fn random<const N: usize>() -> Result<[u8; N]> {
+    use std::io::Read;
+    let mut bytes = [0u8; N];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut bytes))
+        .context("Could not read system randomness")?;
+    Ok(bytes)
+}
+
+pub(crate) fn uuid_v4(mut b: [u8; 16]) -> String {
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex = |range: std::ops::Range<usize>| {
+        b[range]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex(0..4),
+        hex(4..6),
+        hex(6..8),
+        hex(8..10),
+        hex(10..16)
+    )
+}
+
+pub(crate) fn vfat_serial(b: [u8; 4]) -> String {
+    format!("{:02X}{:02X}-{:02X}{:02X}", b[0], b[1], b[2], b[3])
 }
 
 fn preflight_with(
@@ -169,6 +231,7 @@ fn uuid_from_probe(probe: &str, expected: &str) -> Result<String> {
     Ok(uuid.to_owned())
 }
 
+#[cfg(test)]
 pub(crate) fn probe_uuid(device: &str, expected: &str) -> Result<String> {
     // Old /dev/disk/by-uuid aliases can outlive a reformat even after udev
     // settles. Read the superblock itself, never select an alias by its rdev.
@@ -179,29 +242,70 @@ pub(crate) fn probe_uuid(device: &str, expected: &str) -> Result<String> {
 fn format_with(
     filesystem: Filesystem,
     device: &str,
+    uuid: &str,
     mut run: impl FnMut(&str, &[&str], u64) -> Result<String>,
 ) -> Result<()> {
+    check_uuid(uuid, filesystem.name())?;
     // Wiping the whole disk only removes its partition table, not signatures
     // inside its partitions. Do this even when mkfs would accept -f/-F.
     run("wipefs", &["--all", "--force", device], 60)?;
-    run(
-        filesystem.formatter(),
-        &[
-            if filesystem == Filesystem::Ext4 {
-                "-F"
-            } else {
-                "-f"
-            },
-            device,
-        ],
-        300,
-    )?;
-    verify_with(device, filesystem.name(), &mut run)
+    let xfs_uuid = format!("uuid={uuid}");
+    let args: Vec<&str> = match filesystem {
+        Filesystem::Ext4 => vec!["-F", "-U", uuid, device],
+        Filesystem::Btrfs => vec!["-f", "-U", uuid, device],
+        Filesystem::Xfs => vec!["-f", "-m", &xfs_uuid, device],
+    };
+    run(filesystem.formatter(), &args, 300)?;
+    verify_with(device, filesystem.name(), &mut run)?;
+    verify_identity(device, filesystem.name(), uuid, &mut run)
 }
-pub(crate) fn format_efi(device: &str) -> Result<()> {
-    output("wipefs", &["--all", "--force", device], 60)?;
-    output("mkfs.fat", &["-F", "32", device], 60)?;
-    verify_with(device, "vfat", &mut output)
+pub(crate) fn format_efi(device: &str, serial: &str) -> Result<()> {
+    format_efi_with(device, serial, output)
+}
+fn format_efi_with(
+    device: &str,
+    serial: &str,
+    mut run: impl FnMut(&str, &[&str], u64) -> Result<String>,
+) -> Result<()> {
+    check_uuid(serial, "vfat")?;
+    run("wipefs", &["--all", "--force", device], 60)?;
+    run(
+        "mkfs.fat",
+        &["-F", "32", "-i", &serial.replace('-', ""), device],
+        60,
+    )?;
+    verify_with(device, "vfat", &mut run)?;
+    verify_identity(device, "vfat", serial, &mut run)
+}
+pub(crate) fn format_swap(device: &str, uuid: &str) -> Result<()> {
+    format_swap_with(device, uuid, output)
+}
+fn format_swap_with(
+    device: &str,
+    uuid: &str,
+    mut run: impl FnMut(&str, &[&str], u64) -> Result<String>,
+) -> Result<()> {
+    check_uuid(uuid, "swap")?;
+    run("wipefs", &["--all", "--force", device], 60)?;
+    run("mkswap", &["--uuid", uuid, "--label", "swap", device], 60)?;
+    verify_with(device, "swap", &mut run)?;
+    verify_identity(device, "swap", uuid, &mut run)
+}
+/// The superblock must carry exactly the identity written into configuration.
+fn verify_identity(
+    device: &str,
+    kind: &str,
+    expected: &str,
+    run: &mut impl FnMut(&str, &[&str], u64) -> Result<String>,
+) -> Result<()> {
+    let probe = run("blkid", &["--probe", "--output", "export", device], 30)?;
+    let actual = uuid_from_probe(&probe, kind)
+        .with_context(|| format!("Reading the new filesystem UUID on {device}"))?;
+    ensure!(
+        actual.eq_ignore_ascii_case(expected),
+        "Filesystem identity mismatch on {device}: requested {expected}, found {actual}"
+    );
+    Ok(())
 }
 pub(crate) fn mount_efi(device: &str, target: &str) -> Result<()> {
     mount_with("vfat", device, target, "umask=0077", output)
@@ -227,6 +331,7 @@ pub(crate) fn diagnose(error: anyhow::Error, disk: &str) -> anyhow::Error {
     let mut report = format!("Storage preparation failed on {disk}: {error:#}\n");
     let root = crate::disk::partition(disk, 2);
     let boot = crate::disk::partition(disk, 1);
+    let swap = crate::disk::partition(disk, 3);
     for (program, args) in [
         (
             "lsblk",
@@ -239,6 +344,7 @@ pub(crate) fn diagnose(error: anyhow::Error, disk: &str) -> anyhow::Error {
         ),
         ("blkid", vec!["--probe", root.as_str()]),
         ("blkid", vec!["--probe", boot.as_str()]),
+        ("blkid", vec!["--probe", swap.as_str()]),
         ("dmesg", vec!["--ctime", "--level=err,warn"]),
     ] {
         let text = match output(program, &args, 15) {
@@ -327,19 +433,27 @@ mod tests {
             assert_eq!(calls, ["blkid"]);
         }
     }
+    const ROOT: &str = "0f1e2d3c-4b5a-4978-8695-a4b3c2d1e0f9";
+    fn probe(kind: &str, uuid: &str) -> String {
+        format!("DEVNAME=/dev/test\nUUID={uuid}\nTYPE={kind}\n")
+    }
     #[test]
     fn formatting_stops_at_each_failed_step() {
         for fs in Filesystem::ALL {
-            for failure in 0..3 {
+            for failure in 0..4 {
                 let mut calls = 0;
                 assert!(
-                    format_with(fs, "/dev/nvme0n1p2", |_, _, _| {
+                    format_with(fs, "/dev/nvme0n1p2", ROOT, |_, args, _| {
                         let current = calls;
                         calls += 1;
                         if current == failure {
                             anyhow::bail!("injected I/O failure");
                         }
-                        Ok(String::new())
+                        Ok(if args.contains(&"export") {
+                            probe(fs.name(), ROOT)
+                        } else {
+                            format!("{}\n", fs.name())
+                        })
                     })
                     .is_err()
                 );
@@ -348,7 +462,7 @@ mod tests {
         }
     }
     #[test]
-    fn every_formatter_wipes_then_probes_and_mounts_explicitly() {
+    fn every_formatter_requests_and_verifies_the_chosen_identity() {
         for fs in Filesystem::ALL {
             let mut calls = vec![];
             let mut run = |program: &str, args: &[&str], _: u64| {
@@ -356,32 +470,77 @@ mod tests {
                     program.to_owned(),
                     args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                 ));
-                Ok(if program == "blkid" {
+                Ok(if args.contains(&"export") {
+                    probe(fs.name(), ROOT)
+                } else if program == "blkid" {
                     format!("{}\n", fs.name())
                 } else {
                     String::new()
                 })
             };
-            format_with(fs, "/dev/nvme0n1p2", &mut run).unwrap();
-            mount_with(fs.name(), "/dev/nvme0n1p2", "/target", "defaults", &mut run).unwrap();
+            format_with(fs, "/dev/nvme0n1p2", ROOT, &mut run).unwrap();
+            mount_with(
+                fs.name(),
+                "/dev/nvme0n1p2",
+                "/target",
+                &fs.mount_options().join(","),
+                &mut run,
+            )
+            .unwrap();
             assert_eq!(
                 calls.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(),
-                ["wipefs", fs.formatter(), "blkid", "blkid", "mount"]
+                ["wipefs", fs.formatter(), "blkid", "blkid", "blkid", "mount"]
             );
             assert_eq!(calls[0].1, ["--all", "--force", "/dev/nvme0n1p2"]);
-            assert_eq!(
-                calls[4].1,
-                [
-                    "--types",
-                    fs.name(),
-                    "--options",
-                    "defaults",
-                    "--",
-                    "/dev/nvme0n1p2",
-                    "/target"
-                ]
-            );
+            let requested = calls[1].1.join(" ");
+            assert!(requested.contains(ROOT) && requested.ends_with("/dev/nvme0n1p2"));
+            assert!(fs.mount_options().contains(&"noatime"));
+            assert_eq!(calls[5].1[3], fs.mount_options().join(","));
         }
+    }
+    #[test]
+    fn a_mismatched_or_malformed_identity_is_rejected() {
+        let other = "11111111-2222-4333-8444-555555555555";
+        let answer = |kind: &'static str, uuid: &'static str| {
+            move |program: &str, args: &[&str], _: u64| -> Result<String> {
+                Ok(if args.contains(&"export") {
+                    probe(kind, uuid)
+                } else if program == "blkid" {
+                    format!("{kind}\n")
+                } else {
+                    String::new()
+                })
+            }
+        };
+        assert!(format_with(Filesystem::Ext4, "/dev/vda2", ROOT, answer("ext4", other)).is_err());
+        assert!(
+            format_with(
+                Filesystem::Ext4,
+                "/dev/vda2",
+                "not-a-uuid",
+                answer("ext4", ROOT)
+            )
+            .is_err()
+        );
+        assert!(format_swap_with("/dev/vda3", ROOT, answer("swap", ROOT)).is_ok());
+        assert!(format_swap_with("/dev/vda3", ROOT, answer("swap", other)).is_err());
+        assert!(format_efi_with("/dev/vda1", "1A2B-3C4D", answer("vfat", "1A2B-3C4D")).is_ok());
+        assert!(format_efi_with("/dev/vda1", "1A2B-3C4D", answer("vfat", "1A2B-3C4E")).is_err());
+    }
+    #[test]
+    fn generated_identities_are_well_formed_and_distinct() {
+        let a = Identities::generate(Firmware::Uefi, true).unwrap();
+        let b = Identities::generate(Firmware::Uefi, true).unwrap();
+        assert_ne!(a, b);
+        check_uuid(&a.root, "ext4").unwrap();
+        check_uuid(a.swap.as_deref().unwrap(), "swap").unwrap();
+        check_uuid(a.efi.as_deref().unwrap(), "vfat").unwrap();
+        assert_eq!(&a.root[14..15], "4");
+        assert!(matches!(&a.root[19..20], "8" | "9" | "a" | "b"));
+        let bios = Identities::generate(Firmware::Bios, false).unwrap();
+        assert!(bios.efi.is_none() && bios.swap.is_none());
+        assert_eq!(uuid_v4([0; 16]), "00000000-0000-4000-8000-000000000000");
+        assert_eq!(vfat_serial([0x1a, 0x2b, 0x3c, 0x4d]), "1A2B-3C4D");
     }
     #[test]
     fn missing_kernel_support_and_helpers_fail_preflight() {
@@ -502,13 +661,16 @@ mod tests {
             let mount = mount.to_str().unwrap();
             for previous in Filesystem::ALL {
                 for next in Filesystem::ALL {
-                    previous.format(&image.device)?;
-                    let old_uuid = probe_uuid(&image.device, previous.name())?;
+                    let old_uuid = uuid_v4(random()?);
+                    previous.format(&image.device, &old_uuid)?;
                     // Prime the ordinary userspace probe before replacing it.
                     output("blkid", &[&image.device], 30)?;
-                    next.format(&image.device)?;
-                    let new_uuid = probe_uuid(&image.device, next.name())?;
-                    ensure!(new_uuid != old_uuid, "Reformat retained the previous UUID");
+                    let new_uuid = uuid_v4(random()?);
+                    next.format(&image.device, &new_uuid)?;
+                    ensure!(
+                        probe_uuid(&image.device, next.name())? == new_uuid,
+                        "Reformat did not apply the requested UUID"
+                    );
                     next.mount(&image.device, mount)?;
                     ensure!(
                         output(
@@ -540,13 +702,19 @@ mod tests {
                     );
                 }
             }
-            format_efi(&image.device)?;
-            let old_uuid = probe_uuid(&image.device, "vfat")?;
+            format_efi(&image.device, &vfat_serial(random()?))?;
             output("blkid", &[&image.device], 30)?;
-            format_efi(&image.device)?;
+            let serial = vfat_serial(random()?);
+            format_efi(&image.device, &serial)?;
             ensure!(
-                probe_uuid(&image.device, "vfat")? != old_uuid,
-                "FAT reformat retained the previous UUID"
+                probe_uuid(&image.device, "vfat")? == serial,
+                "FAT reformat did not apply the requested serial"
+            );
+            let swap = uuid_v4(random()?);
+            format_swap(&image.device, &swap)?;
+            ensure!(
+                probe_uuid(&image.device, "swap")? == swap,
+                "Swap format did not apply the requested UUID"
             );
             mount_efi(&image.device, mount)?;
             ensure!(

@@ -58,6 +58,11 @@ in
     services.xserver.enable = true;
     services.displayManager.gdm.enable = cfg.desktops == [ "gnome" ];
     services.displayManager.sddm.enable = cfg.desktops != [ "gnome" ];
+    # Plasma's module turns on SDDM's experimental Wayland greeter. Its
+    # hand-off to the user session races kwallet-pam (sddm/sddm#1443): a login
+    # can stall for 30 s and leave the session inactive on a black VT. The X11
+    # greeter is SDDM's default and what the other desktops already use.
+    services.displayManager.sddm.wayland.enable = false;
     services.displayManager.defaultSession = sessions.${cfg.defaultDesktop};
     services.desktopManager.plasma6.enable = has "plasma";
     services.desktopManager.gnome.enable = has "gnome";
@@ -74,6 +79,40 @@ in
         "${pkgs.kdePackages.ksshaskpass}/bin/ksshaskpass"
       else
         "${pkgs.x11_ssh_askpass}/libexec/x11-ssh-askpass";
-    programs.gnupg.agent.pinentryPackage = if has "plasma" then pkgs.pinentry-qt else pkgs.pinentry-gnome3;
+    programs.gnupg.agent.pinentryPackage =
+      if has "plasma" then pkgs.pinentry-qt else pkgs.pinentry-gnome3;
+    # Xfce installs polkit-gnome system-wide, and its autostart entry has no
+    # OnlyShowIn, so it also starts in Plasma, Hyprland and the others and
+    # races their own authentication agents. /etc/xdg is searched first.
+    environment.etc."xdg/autostart/polkit-gnome-authentication-agent-1.desktop" =
+      lib.mkIf (has "xfce")
+        {
+          text = ''
+            [Desktop Entry]
+            Type=Application
+            Name=PolicyKit Authentication Agent
+            Exec=${pkgs.polkit_gnome}/libexec/polkit-gnome-authentication-agent-1
+            NoDisplay=true
+            OnlyShowIn=XFCE;
+          '';
+        };
+    # GNOME enables IBus, whose autostart entry skips only GNOME and KDE. In
+    # the Hyprland sessions it only reports that it should run from GNOME.
+    environment.etc."xdg/autostart/ibus-daemon.desktop" =
+      lib.mkIf
+        (
+          (has "hyprland" || has "omarchy")
+          && config.i18n.inputMethod.enable
+          && config.i18n.inputMethod.type == "ibus"
+        )
+        {
+          text = ''
+            [Desktop Entry]
+            Type=Application
+            Name=IBus
+            Exec=${config.i18n.inputMethod.package}/bin/ibus-daemon --daemonize --xim
+            NotShowIn=GNOME;KDE;Hyprland;
+          '';
+        };
   };
 }

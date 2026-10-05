@@ -76,6 +76,17 @@ in
         enable = true;
         package = pkgs.ananicy-cpp;
         rulesProvider = pkgs.ananicy-rules-cachyos;
+        # Adjust priorities only; never move processes between cgroups. A
+        # process outside its systemd unit escapes logind and polkit session
+        # tracking (a compositor can then no longer switch VTs) and outlives
+        # its unit at logout, still holding the GPU for the next session.
+        # nixpkgs forces the realtime workaround, which moves compositors to
+        # the root cgroup.
+        settings = {
+          cgroup_load = false;
+          apply_cgroup = false;
+          cgroup_realtime_workaround = lib.mkForce false;
+        };
       };
       # Kill the largest offender under sustained memory pressure instead of
       # letting the desktop thrash.

@@ -246,6 +246,51 @@ only the process group spawned by that operation. Cleanup attempts to unmount;
 it never recursively deletes a target mount directory. There is no automatic
 reboot. The installer cannot promise rollback after a partition table is erased.
 
+## Updating installed systems
+
+The installed `/etc/nixos` contains only `flake.nix`, `flake.lock`,
+`configuration.nix` and `hardware-configuration.nix`. The desktop, Hyprland,
+Omarchy, swap/zswap, tuning and application modules come from the flake input
+`calamares`, which follows this repository's `stable` branch:
+
+```nix
+inputs.calamares.url = "github:bitemyapp/calamares/stable";
+inputs.calamares.inputs.nixpkgs.follows = "nixpkgs";
+# ...
+modules = [ determinate.nixosModules.default calamares.nixosModules.default ./configuration.nix ];
+```
+
+The installation records the exact revision on the media in `flake.lock`.
+Bug fixes then need no reinstall:
+
+```sh
+sudo nix flake update calamares --flake /etc/nixos
+sudo nixos-rebuild boot --flake /etc/nixos   # then reboot
+```
+
+`nix flake update` without an input name also updates Nixpkgs and the
+applications. `stable` moves only to revisions verified in a complete
+installation image. The default branch carries reviewed, merged work ahead of
+it.
+
+The flake also works without this installer: `nixosModules.default` (or
+`nixosModules.desktops` and `nixosModules.applications`) provides the
+`calamares.*` options: `desktops`, `defaultDesktop`, `tuning.enable`,
+`zswap.enable`, `applications` and `installUser`. `packages.x86_64-linux.omarchy`
+is the Omarchy-style session's helper.
+
+Systems installed before this layout carry copies under `/etc/nixos/calamares`
+and `/etc/nixos/applications.nix`. Convert one by adding the two input lines
+and `calamares.nixosModules.default` to `/etc/nixos/flake.nix` as above (also
+add `calamares` to the `outputs` function's arguments), changing the imports in
+`configuration.nix` to `imports = [ ./hardware-configuration.nix ];`, then:
+
+```sh
+sudo nix flake lock /etc/nixos           # adds calamares at stable
+sudo nixos-rebuild boot --flake /etc/nixos
+sudo rm -r /etc/nixos/calamares /etc/nixos/applications.nix /etc/nixos/applications.json
+```
+
 ## Build and test
 
 ```
@@ -318,8 +363,9 @@ is macOS-only.
 
 The target flake supplies independently pinned application Nixpkgs, Numtide's
 `llm-agents.nix`, and upstream oh-my-pi. Its full lock is preserved. Both app
-catalog and module are copied into `/etc/nixos` with the selected IDs in
-`configuration.nix`; installed versions and store paths are recorded in
+catalog and module come from the flake's `calamares` input (see "Updating
+installed systems"), with the selected IDs in `configuration.nix`; installed
+versions and store paths are recorded in
 `/etc/installer-applications.json`. Terminal applications receive menu launchers.
 
 Before the first disk write, the helper builds the complete installed system,

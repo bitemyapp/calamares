@@ -7,11 +7,9 @@ pkgs.rustPlatform.buildRustPackage {
     fileset = pkgs.lib.fileset.unions [
       ../rust/Cargo.toml
       ../rust/Cargo.lock
-      ../rust/build.rs
       ../rust/data
       ../rust/reference.nix
       ../rust/src
-      ../rust/system
     ];
   };
   cargoLock.lockFile = ../rust/Cargo.lock;

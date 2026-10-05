@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copied verbatim into /etc/nixos; all sources come from the installed flake.lock.
+# Exported as nixosModules.applications by this repository's flake; installed
+# systems import it from their `calamares` input. Package sources come from the
+# installed flake.lock.
 {
   config,
   lib,

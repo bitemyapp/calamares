@@ -5,7 +5,6 @@ use serde::Deserialize;
 use std::{collections::BTreeSet, sync::OnceLock};
 
 pub const CATALOG_JSON: &str = include_str!("applications.json");
-pub const NIX_MODULE: &str = include_str!("applications.nix");
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

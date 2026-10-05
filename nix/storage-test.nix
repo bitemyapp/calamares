@@ -8,10 +8,8 @@ let
       fileset = pkgs.lib.fileset.unions [
         ../rust/Cargo.toml
         ../rust/Cargo.lock
-        ../rust/build.rs
         ../rust/reference.nix
         ../rust/src
-        ../rust/system
       ];
     };
     cargoLock.lockFile = ../rust/Cargo.lock;
@@ -45,7 +43,12 @@ pkgs.testers.runNixOSTest {
   # Also runs inside the rootless ISO builder without nested KVM.
   requiredFeatures.kvm = false;
   nodes.machine = {
-    boot.supportedFilesystems = [ "ext4" "btrfs" "xfs" "vfat" ];
+    boot.supportedFilesystems = [
+      "ext4"
+      "btrfs"
+      "xfs"
+      "vfat"
+    ];
     boot.kernelModules = [ "loop" ];
     virtualisation.memorySize = 2048;
     environment.systemPackages = [ tests ];

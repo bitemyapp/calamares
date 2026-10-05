@@ -88,12 +88,9 @@ pub fn apply(ui: &Rc<Ui>) {
         .position(|d| *d == Desktop::Omarchy)
         .unwrap()]
     .set_active(true);
-    ui.location.timezone.set_text("America/Chicago");
-    ui.location.spinner.set_visible(false);
-    ui.location
-        .status
-        .set_text("Using the live system's configured zone. Check it before continuing.");
-    ui.location.confirm.set_active(true);
+    if let Some(index) = ui.zones.as_ref().and_then(|z| z.find("America/Chicago")) {
+        ui.show_zone(index, &detection_note(Source::Internet("geoip.kde.org")));
+    }
     // Sample selections scheduled real warming; show a fixed indicator instead.
     ui.stop_warm();
     ui.activity_spinner.set_visible(true);

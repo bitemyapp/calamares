@@ -270,3 +270,28 @@ button.card.desktop-card:checked:hover {
 .done-page .icon {
   color: var(--success-color);
 }
+
+/* Time zone map. */
+.zone-card zonemap {
+  margin: 6px 6px 0 6px;
+}
+
+.zone-info {
+  padding: 10px 18px 12px 18px;
+}
+
+.zone-name {
+  font-size: 1.3em;
+  font-weight: 800;
+}
+
+.zone-time {
+  font-size: 1.3em;
+  font-weight: 700;
+  font-feature-settings: "tnum";
+}
+
+.zone-status {
+  padding: 4px 6px 4px 18px;
+  min-height: 40px;
+}

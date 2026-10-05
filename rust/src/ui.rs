@@ -7,6 +7,7 @@ mod pages;
 #[cfg(debug_assertions)]
 mod preview;
 mod widgets;
+mod zonemap;
 
 use adw::prelude::*;
 use calamares_nixos::{
@@ -17,7 +18,8 @@ use calamares_nixos::{
     memory::{self, MemInfo},
     precache,
     session::{Session, Update},
-    timezone,
+    timezone::{self, Source},
+    zonemap::Zones,
 };
 use gtk::{Align, CheckButton, Label, Orientation, glib};
 use pages::*;
@@ -273,8 +275,17 @@ struct Ui {
     default_desktops: RefCell<Vec<Desktop>>,
     default_choice: Cell<Option<Desktop>>,
     updating_default: Cell<bool>,
+    zones: Option<Rc<Zones>>,
+    zoneinfo: String,
+    /// Index into `zones.places` of the chosen time zone.
+    zone: Cell<Option<usize>>,
+    /// Detections apply only while the user has not chosen a zone.
+    zone_manual: Cell<bool>,
+    /// The last detection found nothing and fell back to New York.
+    zone_fallback: Cell<bool>,
+    zone_updating: Cell<bool>,
     zone_epoch: Cell<u64>,
-    zone_running: Cell<bool>,
+    zone_pending: Cell<Option<u64>>,
     reviewing: Cell<bool>,
     generation: Cell<u64>,
     session: RefCell<Option<Session>>,
@@ -322,7 +333,15 @@ pub fn build(app: &adw::Application) {
             }
         }),
     );
-    let (location_widget, location) = build_location_page();
+    let zoneinfo = zoneinfo_dir();
+    let zones = match Zones::load(std::path::Path::new(&zoneinfo)) {
+        Ok(zones) => Some(Rc::new(zones)),
+        Err(error) => {
+            eprintln!("time zone map unavailable: {error:#}");
+            None
+        }
+    };
+    let (location_widget, location) = build_location_page(zones.clone());
     let review = build_review_page();
     let install = build_install_page();
     stack.add_named(&welcome, Some(Step::Welcome.name()));
@@ -420,8 +439,14 @@ pub fn build(app: &adw::Application) {
         default_desktops: RefCell::new(Vec::new()),
         default_choice: Cell::new(Some(Desktop::Plasma)),
         updating_default: Cell::new(false),
+        zones,
+        zoneinfo,
+        zone: Cell::new(None),
+        zone_manual: Cell::new(false),
+        zone_fallback: Cell::new(false),
+        zone_updating: Cell::new(false),
         zone_epoch: Cell::new(0),
-        zone_running: Cell::new(false),
+        zone_pending: Cell::new(None),
         reviewing: Cell::new(false),
         generation: Cell::new(0),
         session: RefCell::new(None),
@@ -460,6 +485,18 @@ pub fn build(app: &adw::Application) {
         ui.detect_zone();
         ui.schedule_warm();
     }
+    glib::timeout_add_seconds_local(15, {
+        let ui = Rc::downgrade(&ui);
+        move || match ui.upgrade() {
+            Some(ui) if !ui.closed.get() => {
+                if ui.step.get() == Step::Location {
+                    ui.refresh_zone_clock();
+                }
+                glib::ControlFlow::Continue
+            }
+            _ => glib::ControlFlow::Break,
+        }
+    });
     glib::timeout_add_local(Duration::from_millis(60), {
         let ui = ui.clone();
         move || {
@@ -496,6 +533,52 @@ pub fn build(app: &adw::Application) {
     #[cfg(debug_assertions)]
     if preview {
         preview::apply(&ui);
+    }
+}
+
+/// tzdata used for the installed system; outside the live ISO (previews),
+/// the host's.
+fn zoneinfo_dir() -> String {
+    Settings::load()
+        .map(|s| s.zoneinfo)
+        .ok()
+        .or_else(|| std::env::var("TZDIR").ok().filter(|d| !d.is_empty()))
+        .unwrap_or_else(|| "/usr/share/zoneinfo".into())
+}
+
+fn zone_now(zoneinfo: &str, zone: &str) -> Option<glib::DateTime> {
+    // An absolute path makes GLib read exactly this tzdata.
+    let tz = glib::TimeZone::from_identifier(Some(&format!("{zoneinfo}/{zone}")))?;
+    glib::DateTime::now(&tz).ok()
+}
+
+fn zone_offset_minutes(zoneinfo: &str, zone: &str) -> Option<i32> {
+    i32::try_from(zone_now(zoneinfo, zone)?.utc_offset().as_seconds() / 60).ok()
+}
+
+fn utc_offset(seconds: i64) -> String {
+    if seconds == 0 {
+        return "UTC".into();
+    }
+    let sign = if seconds < 0 { '\u{2212}' } else { '+' };
+    let minutes = seconds.abs() / 60;
+    format!("UTC{sign}{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+fn detection_note(source: Source) -> String {
+    match source {
+        Source::Live => "From this live system's settings.".into(),
+        Source::Internet(service) => {
+            format!("Located through your internet connection by {service}; a VPN can mislead it.")
+        }
+        Source::Clock { offset_minutes } => format!(
+            "Estimated from the computer's clock, which keeps local time ({}).",
+            utc_offset(i64::from(offset_minutes) * 60)
+        ),
+        Source::Fallback => {
+            "Your location couldn't be detected, so New York is selected. Click where you are."
+                .into()
+        }
     }
 }
 
@@ -615,24 +698,41 @@ impl Ui {
                 }
             }
         });
-        self.location.timezone.connect_changed({
+        self.location.map.connect_picked({
             let weak = Rc::downgrade(self);
-            move |_| {
+            move |index| {
                 if let Some(ui) = weak.upgrade() {
-                    ui.zone_epoch.set(ui.zone_epoch.get().wrapping_add(1));
-                    ui.location.confirm.set_active(false);
+                    ui.choose_zone(index, "Chosen on the map.");
+                }
+            }
+        });
+        self.location.zone_list.connect_selected_notify({
+            let weak = Rc::downgrade(self);
+            move |row| {
+                if let Some(ui) = weak.upgrade()
+                    && !ui.zone_updating.get()
+                    && row.selected() != gtk::INVALID_LIST_POSITION
+                {
+                    ui.choose_zone(row.selected() as usize, "Chosen from the list.");
                 }
             }
         });
         self.location.detect.connect_clicked({
-            let f = with(Ui::detect_zone);
-            move |_| f()
+            let weak = Rc::downgrade(self);
+            move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.zone_manual.set(false);
+                    ui.detect_zone();
+                }
+            }
         });
         self.location.internet.connect_active_notify({
             let weak = Rc::downgrade(self);
             move |_| {
-                if let Some(ui) = weak.upgrade() {
-                    ui.zone_epoch.set(ui.zone_epoch.get().wrapping_add(1));
+                if let Some(ui) = weak.upgrade()
+                    && !ui.zone_manual.get()
+                {
+                    ui.detect_zone();
                 }
             }
         });
@@ -666,6 +766,15 @@ impl Ui {
     // ---- Navigation -------------------------------------------------------
 
     fn go(self: &Rc<Self>, step: Step) {
+        // The network may have come up since detection found nothing.
+        if step == Step::Location
+            && self.step.get() != step
+            && self.zone_fallback.get()
+            && !self.zone_manual.get()
+            && self.zone_pending.get().is_none()
+        {
+            self.detect_zone();
+        }
         self.step.set(step);
         if step > self.reached.get() {
             self.reached.set(step);
@@ -1122,22 +1231,89 @@ impl Ui {
     // ---- Time zone --------------------------------------------------------
 
     fn detect_zone(self: &Rc<Self>) {
-        self.zone_running.set(true);
         self.zone_epoch.set(self.zone_epoch.get().wrapping_add(1));
         let generation = self.zone_epoch.get();
+        self.zone_pending.set(Some(generation));
         let internet = self.location.internet.is_active();
         self.location.spinner.set_visible(true);
         self.location.detect.set_sensitive(false);
-        self.location
-            .status
-            .set_text("Detecting the time zone… you can still enter it yourself.");
+        self.location.status.set_text("Finding your location…");
         let send = self.send.clone();
+        let zoneinfo = self.zoneinfo.clone();
         thread::spawn(move || {
-            let result = Settings::load()
-                .and_then(|s| timezone::detect(std::path::Path::new(&s.zoneinfo), internet))
+            let offset_now = |zone: &str| zone_offset_minutes(&zoneinfo, zone);
+            let result = timezone::detect(std::path::Path::new(&zoneinfo), internet, &offset_now)
                 .map_err(|e| format!("{e:#}"));
             let _ = send.send(Message::Zone(generation, result));
         });
+    }
+
+    /// A zone the user picked; later detections no longer replace it.
+    fn choose_zone(self: &Rc<Self>, index: usize, note: &str) {
+        self.zone_manual.set(true);
+        self.zone_fallback.set(false);
+        self.zone_epoch.set(self.zone_epoch.get().wrapping_add(1));
+        if self.zone_pending.take().is_some() {
+            self.location.spinner.set_visible(false);
+            self.location.detect.set_sensitive(true);
+        }
+        self.show_zone(index, note);
+    }
+
+    fn show_zone(&self, index: usize, note: &str) {
+        if self.zones.as_ref().is_none_or(|z| index >= z.places.len()) {
+            return;
+        }
+        self.zone.set(Some(index));
+        self.location.map.select(Some(index));
+        self.zone_updating.set(true);
+        self.location.zone_list.set_selected(index as u32);
+        self.zone_updating.set(false);
+        self.refresh_zone_clock();
+        self.location.status.set_text(note);
+    }
+
+    fn selected_place(&self) -> Option<&calamares_nixos::zonemap::Place> {
+        self.zones.as_ref()?.places.get(self.zone.get()?)
+    }
+
+    /// The chosen zone's name, local time and UTC offset, which change with
+    /// the clock and daylight saving time.
+    fn refresh_zone_clock(&self) {
+        let Some(place) = self.selected_place() else {
+            return;
+        };
+        let location = &self.location;
+        let now = zone_now(&self.zoneinfo, &place.zone);
+        let daylight = now
+            .as_ref()
+            .is_some_and(glib::DateTime::is_daylight_savings);
+        location
+            .zone_name
+            .set_text(place.name(daylight).unwrap_or(&place.zone));
+        location.zone_place.set_text(&if place.position.is_some() {
+            place.label()
+        } else {
+            "The same everywhere, with no daylight saving time".into()
+        });
+        let mut detail = Vec::new();
+        if let Some(now) = &now {
+            location.zone_time.set_text(
+                &now.format("%-l:%M %p")
+                    .map(|t| t.to_string())
+                    .unwrap_or_default(),
+            );
+            let abbreviation = now.timezone_abbreviation();
+            if abbreviation.starts_with(|c: char| c.is_ascii_alphabetic()) && abbreviation != "UTC"
+            {
+                detail.push(abbreviation.to_string());
+            }
+            detail.push(utc_offset(now.utc_offset().as_seconds()));
+        } else {
+            location.zone_time.set_text("");
+        }
+        detail.push(place.zone.clone());
+        location.zone_detail.set_text(&detail.join(" · "));
     }
 
     // ---- Speculative caching ----------------------------------------------
@@ -1224,10 +1400,11 @@ impl Ui {
                 return;
             }
         }
-        if !self.location.confirm.is_active() {
-            self.toast("Check the time zone and confirm it before continuing.");
+        let Some(timezone) = self.selected_place().map(|p| p.zone.clone()) else {
+            self.go(Step::Location);
+            self.toast("Choose your time zone on the map.");
             return;
-        }
+        };
         let Some(disk) = self
             .selected_disk
             .get()
@@ -1249,7 +1426,7 @@ impl Ui {
                 .get(self.location.locale.selected() as usize)
                 .unwrap_or(&LOCALES[0])
                 .to_string(),
-            timezone: self.location.timezone.text().trim().into(),
+            timezone,
             keyboard: KEYBOARDS
                 .get(self.location.keyboard.selected() as usize)
                 .unwrap_or(&KEYBOARDS[0])
@@ -1385,7 +1562,15 @@ impl Ui {
             format!("{} ({})", review.full_name, review.username)
         });
         r.locale.set_subtitle(&review.locale);
-        r.zone.set_subtitle(&review.timezone);
+        r.zone.set_subtitle(
+            &self
+                .zones
+                .as_ref()
+                .and_then(|z| z.places.get(z.find(&review.timezone)?))
+                .filter(|p| p.position.is_some())
+                .and_then(|p| Some(format!("{} — {} ({})", p.name(false)?, p.label(), p.zone)))
+                .unwrap_or_else(|| review.timezone.clone()),
+        );
         r.keyboard.set_subtitle(&review.keyboard);
         let phrase = format!("ERASE {}", disk.path);
         r.erase.set_title(&format!("Type {phrase} to confirm"));
@@ -1673,21 +1858,30 @@ impl Ui {
                 }
             }
             Message::Zone(generation, result) => {
-                self.zone_running.set(false);
+                // Superseded by a manual choice or a newer detection.
+                if self.zone_pending.get() != Some(generation) {
+                    return;
+                }
+                self.zone_pending.set(None);
                 self.location.spinner.set_visible(false);
                 self.location.detect.set_sensitive(true);
-                if generation == self.zone_epoch.get() {
-                    match result {
-                        Ok(found) => {
-                            self.location.timezone.set_text(found.zone.as_str());
-                            self.location.status.set_text(&found.explanation);
+                match result {
+                    Ok(found) => {
+                        self.zone_fallback.set(found.source == Source::Fallback);
+                        match self.zones.as_ref().and_then(|z| {
+                            z.find_equivalent(
+                                found.zone.as_str(),
+                                std::path::Path::new(&self.zoneinfo),
+                            )
+                        }) {
+                            Some(index) => self.show_zone(index, &detection_note(found.source)),
+                            None => self.location.status.set_text(&format!(
+                                "Detected {}, which is not on the map. Choose your time zone.",
+                                found.zone.as_str()
+                            )),
                         }
-                        Err(error) => self.location.status.set_text(&error),
                     }
-                } else {
-                    self.location.status.set_text(
-                        "Your manual choice was kept; the detection result was not applied.",
-                    );
+                    Err(error) => self.location.status.set_text(&error),
                 }
             }
             Message::Warm {

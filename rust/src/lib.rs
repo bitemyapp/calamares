@@ -15,6 +15,8 @@ pub use filesystem::Filesystem;
 pub use plan::{ConfirmedInstall, Hostname, InstallPlan, RawRequest, Username};
 pub mod timezone;
 pub mod wifi;
+#[cfg(feature = "gui")]
+pub mod zonemap;
 pub use desktop::Desktop;
 #[cfg(test)]
 mod plan_tests;

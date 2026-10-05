@@ -4,11 +4,15 @@
 use super::{
     KEYBOARD_NAMES, LOCALE_NAMES, Step,
     widgets::{LayoutBar, caption, clamp, desktop_card, icon, label, property, scrolled},
+    zonemap::ZoneMap,
 };
 use adw::prelude::*;
-use calamares_nixos::{Desktop, Filesystem, KEYBOARDS, LOCALES};
+use calamares_nixos::{
+    Desktop, Filesystem, KEYBOARDS, LOCALES,
+    zonemap::{Place, Zones},
+};
 use gtk::{Align, CheckButton, Label, Orientation};
-use std::cell::RefCell;
+use std::{cell::RefCell, rc::Rc};
 
 /// Installation steps reported as `Event::Progress { step: 1..=6 }`.
 pub(super) const INSTALL_STEPS: [&str; 6] = [
@@ -55,12 +59,16 @@ pub(super) struct DesktopPage {
 }
 
 pub(super) struct LocationPage {
-    pub(super) timezone: adw::EntryRow,
+    pub(super) map: ZoneMap,
+    pub(super) zone_name: Label,
+    pub(super) zone_place: Label,
+    pub(super) zone_time: Label,
+    pub(super) zone_detail: Label,
+    pub(super) zone_list: adw::ComboRow,
     pub(super) detect: gtk::Button,
     pub(super) spinner: adw::Spinner,
     pub(super) status: Label,
     pub(super) internet: adw::SwitchRow,
-    pub(super) confirm: CheckButton,
     pub(super) locale: adw::ComboRow,
     pub(super) keyboard: adw::ComboRow,
 }
@@ -432,35 +440,97 @@ pub(super) fn build_desktop_page() -> (adw::PreferencesPage, DesktopPage) {
     )
 }
 
-pub(super) fn build_location_page() -> (adw::PreferencesPage, LocationPage) {
-    let page = adw::PreferencesPage::new();
-    let zone = group(
-        "Time Zone",
-        "Region-based zones handle daylight saving automatically: US Central is America/Chicago and US Eastern is America/New_York. Locale and country alone cannot determine your zone.",
-    );
-    let timezone = adw::EntryRow::builder().title("Time zone").build();
+pub(super) fn build_location_page(zones: Option<Rc<Zones>>) -> (gtk::ScrolledWindow, LocationPage) {
+    let labels: Vec<String> = zones
+        .iter()
+        .flat_map(|z| z.places.iter().map(Place::label))
+        .collect();
+    let map = ZoneMap::new(zones);
+    let text = |class: &str, xalign: f32| {
+        let label = Label::new(None);
+        label.add_css_class(class);
+        label.set_xalign(xalign);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        label
+    };
+    let zone_name = text("zone-name", 0.0);
+    let zone_place = text("dim-label", 0.0);
+    let names = gtk::Box::new(Orientation::Vertical, 2);
+    names.set_hexpand(true);
+    names.append(&zone_name);
+    names.append(&zone_place);
+    let zone_time = text("zone-time", 1.0);
+    let zone_detail = text("caption", 1.0);
+    zone_detail.add_css_class("dim-label");
+    let clock = gtk::Box::new(Orientation::Vertical, 2);
+    clock.set_valign(Align::Center);
+    clock.append(&zone_time);
+    clock.append(&zone_detail);
+    let info = gtk::Box::new(Orientation::Horizontal, 12);
+    info.add_css_class("zone-info");
+    info.append(&names);
+    info.append(&clock);
+
     let spinner = adw::Spinner::new();
     spinner.set_visible(false);
-    let detect = gtk::Button::from_icon_name("find-location-symbolic");
+    let status = caption("Finding your location…");
+    status.set_hexpand(true);
+    status.set_valign(Align::Center);
+    let detect = gtk::Button::builder()
+        .child(
+            &adw::ButtonContent::builder()
+                .icon_name("find-location-symbolic")
+                .label("Detect")
+                .build(),
+        )
+        .tooltip_text("Detect the time zone again")
+        .valign(Align::Center)
+        .build();
     detect.add_css_class("flat");
-    detect.set_valign(Align::Center);
-    detect.set_tooltip_text(Some("Detect the time zone again"));
-    timezone.add_suffix(&spinner);
-    timezone.add_suffix(&detect);
-    zone.add(&timezone);
+    let footer = gtk::Box::new(Orientation::Horizontal, 8);
+    footer.add_css_class("zone-status");
+    footer.append(&spinner);
+    footer.append(&status);
+    footer.append(&detect);
+
+    let card = gtk::Box::new(Orientation::Vertical, 0);
+    card.add_css_class("card");
+    card.add_css_class("zone-card");
+    card.set_overflow(gtk::Overflow::Hidden);
+    card.append(&map);
+    card.append(&info);
+    card.append(&gtk::Separator::new(Orientation::Horizontal));
+    card.append(&footer);
+    let zone = group(
+        "Time Zone",
+        "Click where you are on the map, or search for a nearby city.",
+    );
+    zone.add(&card);
+
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let zone_list = adw::ComboRow::builder()
+        .title("Time zone")
+        .model(&gtk::StringList::new(&refs))
+        .enable_search(true)
+        .search_match_mode(gtk::StringFilterMatchMode::Substring)
+        .expression(gtk::PropertyExpression::new(
+            gtk::StringObject::static_type(),
+            None::<&gtk::Expression>,
+            "string",
+        ))
+        .build();
     let internet = adw::SwitchRow::builder()
-        .title("Use internet detection")
-        .subtitle("Only when the live time zone is unset. ipapi.co receives your public IP address; VPNs and mobile networks can be wrong.")
+        .title("Find my location online")
+        .subtitle("Asks geoip.kde.org, or ipinfo.io if it is unavailable. They see your public IP address, and VPNs or mobile networks can place you elsewhere.")
         .active(true)
         .build();
-    zone.add(&internet);
-    let (confirm_row, confirm) =
-        check_row("I have checked that this time zone is correct for my location");
-    zone.add(&confirm_row);
-    let status = caption("Checking the live system's time zone…");
-    status.set_margin_top(10);
-    zone.add(&status);
-    page.add(&zone);
+    // Nothing is selected until detection or the user chooses.
+    zone_list.set_selected(gtk::INVALID_LIST_POSITION);
+    zone_name.set_text("Finding your time zone");
+    zone_place.set_text("You can click your location on the map at any time");
+    let choices = adw::PreferencesGroup::new();
+    choices.add(&zone_list);
+    choices.add(&internet);
     let language = group(
         "Language and Keyboard",
         "The live keyboard layout is unchanged; these apply to the installed system.",
@@ -491,16 +561,27 @@ pub(super) fn build_location_page() -> (adw::PreferencesPage, LocationPage) {
         ))
         .build();
     language.add(&keyboard);
-    page.add(&language);
+    let content = gtk::Box::new(Orientation::Vertical, 24);
+    content.set_margin_top(24);
+    content.set_margin_bottom(24);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+    content.append(&zone);
+    content.append(&choices);
+    content.append(&language);
     (
-        page,
+        scrolled(&clamp(&content, 760)),
         LocationPage {
-            timezone,
+            map,
+            zone_name,
+            zone_place,
+            zone_time,
+            zone_detail,
+            zone_list,
             detect,
             spinner,
             status,
             internet,
-            confirm,
             locale,
             keyboard,
         },

@@ -710,12 +710,6 @@ mod tests {
                 probe_uuid(&image.device, "vfat")? == serial,
                 "FAT reformat did not apply the requested serial"
             );
-            let swap = uuid_v4(random()?);
-            format_swap(&image.device, &swap)?;
-            ensure!(
-                probe_uuid(&image.device, "swap")? == swap,
-                "Swap format did not apply the requested UUID"
-            );
             mount_efi(&image.device, mount)?;
             ensure!(
                 output(
@@ -728,6 +722,13 @@ mod tests {
                 "Wrong EFI filesystem"
             );
             output("umount", &[mount], 30)?;
+            // Swap replaces the FAT signature and must carry the chosen UUID.
+            let swap = uuid_v4(random()?);
+            format_swap(&image.device, &swap)?;
+            ensure!(
+                probe_uuid(&image.device, "swap")? == swap,
+                "Swap format did not apply the requested UUID"
+            );
         }
         Ok(())
     }

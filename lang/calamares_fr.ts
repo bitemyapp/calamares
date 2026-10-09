@@ -658,13 +658,13 @@ L'installateur se fermera et les changements seront perdus.</translation>
       <location filename="../src/modules/partition/jobs/ChangeFilesystemLabelJob.cpp" line="41"/>
       <source>Set filesystem label &lt;strong&gt;%1&lt;/strong&gt; to partition &lt;strong&gt;%2&lt;/strong&gt;</source>
       <comment>@info</comment>
-      <translation type="unfinished"/>
+      <translation>Mettre le nom du système de fichier &lt;strong&gt;%1&lt;/strong&gt; à la partition &lt;strong&gt;%2&lt;/strong&gt;.</translation>
     </message>
     <message>
       <location filename="../src/modules/partition/jobs/ChangeFilesystemLabelJob.cpp" line="50"/>
       <source>Setting filesystem label &lt;strong&gt;%1&lt;/strong&gt; to partition &lt;strong&gt;%2&lt;/strong&gt;…</source>
       <comment>@status</comment>
-      <translation type="unfinished"/>
+      <translation>Mettre le nom du système de fichier &lt;strong&gt;%1&lt;/strong&gt; à la partition &lt;strong&gt;%2&lt;/strong&gt;.</translation>
     </message>
     <message>
       <location filename="../src/modules/partition/jobs/ChangeFilesystemLabelJob.cpp" line="72"/>
@@ -4027,19 +4027,19 @@ Sortie
       <location filename="../src/modules/partition/jobs/SetPartitionFlagsJob.cpp" line="80"/>
       <source>Set flags on partition &lt;strong&gt;%1&lt;/strong&gt; to &lt;strong&gt;%2&lt;/strong&gt;</source>
       <comment>@info</comment>
-      <translation type="unfinished"/>
+      <translation>Définir drapeaux sur partition &lt;strong&gt;%1&lt;/strong&gt; comme &lt;strong&gt;%2&lt;/strong&gt;.</translation>
     </message>
     <message>
       <location filename="../src/modules/partition/jobs/SetPartitionFlagsJob.cpp" line="88"/>
       <source>Set flags on %1MiB &lt;strong&gt;%2&lt;/strong&gt; partition to &lt;strong&gt;%3&lt;/strong&gt;</source>
       <comment>@info</comment>
-      <translation type="unfinished"/>
+      <translation>Définir les indicateurs sur la partition &lt;strong&gt;%2&lt;/strong&gt; de %1 MiB à &lt;strong&gt;%3&lt;/strong&gt;</translation>
     </message>
     <message>
       <location filename="../src/modules/partition/jobs/SetPartitionFlagsJob.cpp" line="94"/>
       <source>Set flags on new partition to &lt;strong&gt;%1&lt;/strong&gt;</source>
       <comment>@info</comment>
-      <translation type="unfinished"/>
+      <translation>Définir les indicateurs sur la nouvelle partition à &lt;strong&gt;%1&lt;/strong&gt;</translation>
     </message>
     <message>
       <location filename="../src/modules/partition/jobs/SetPartitionFlagsJob.cpp" line="105"/>
@@ -4280,7 +4280,7 @@ Sortie
     <message>
       <location filename="../src/modules/unpackfsc/TarballRunner.cpp" line="84"/>
       <source>Tarball extract file %1</source>
-      <translation type="unfinished"/>
+      <translation>Extraire le fichier %1 de l'archive tarball</translation>
     </message>
   </context>
   <context>
@@ -4438,7 +4438,7 @@ Sortie
     <message>
       <location filename="../src/modules/unpackfsc/UnpackFSCJob.cpp" line="61"/>
       <source>Unpack filesystems</source>
-      <translation type="unfinished"/>
+      <translation>Décompresser les systèmes de fichiers</translation>
     </message>
   </context>
   <context>
@@ -5074,7 +5074,31 @@ ls -l /home
  * AMD CPU systems
 
 The vertical scrollbar is adjustable, current width set to 10.</source>
-      <translation type="unfinished"/>
+      <translation>### %1
+Ceci est un exemple de fichier QML, montrant des options rn Markdown avec du contenu Flickable.
+
+QML avec RichText peut utiliser des balises HTML, avec Markdown il utilise la syntaxe simple Markdown, le contenu Flickable est utile pour les écrans tactiles.
+
+**Ceci est du texte en gras**
+
+*Ceci est du texte en italique*
+
+_Ceci est du texte souligné_
+
+&gt;citation
+
+~~Ceci est barré~~
+
+Exemple de code :
+```
+ls -l /home
+```
+
+**Listes :**
+* Systèmes CPU Intel
+* Systèmes CPU AMD
+
+La barre de défilement verticale est réglable, la largeur actuelle est réglée sur 10.</translation>
     </message>
     <message>
       <location filename="../src/modules/welcomeq/release_notes.qml" line="80"/>

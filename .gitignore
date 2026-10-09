@@ -55,3 +55,9 @@ CMakeLists.txt.user
 # Kate
 *.kate-swp
 tags
+# Native NixOS Rust implementation and disposable verification outputs.
+/rust/target/
+/tests/vm-fixture/target/
+/.work/
+/artifacts/
+/result*

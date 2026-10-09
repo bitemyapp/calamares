@@ -1,0 +1,69 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1790822859,
+        "narHash": "sha256-69xHQhAeMAD2wDXO7T2pcOZIF9Sga2W+JkmY2a11Ops=",
+        "rev": "c59305bab2065cfecc4944690d9eedbb56f3a9fa",
+        "revCount": 1083223,
+        "type": "tarball",
+        "url": "https://api.flakehub.com/f/pinned/NixOS/nixpkgs/0.1.1083223%2Brev-c59305bab2065cfecc4944690d9eedbb56f3a9fa/01a0f7ef-16af-76d0-a080-65d8f4749119/source.tar.gz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://flakehub.com/f/NixOS/nixpkgs/0.1"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "tatami": "tatami",
+        "yukimi": "yukimi"
+      }
+    },
+    "tatami": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1791449124,
+        "narHash": "sha256-lKrbVD2A9jRbZ3zzyCSq9o+fquKzm/9g3ikr+PgTNMM=",
+        "owner": "bitemyapp",
+        "repo": "tatami",
+        "rev": "723c3ab5c029517dd7cd15f6234e295730c607c0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "bitemyapp",
+        "ref": "stable",
+        "repo": "tatami",
+        "type": "github"
+      }
+    },
+    "yukimi": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1791569872,
+        "narHash": "sha256-ReJUWb1b4Wio1UFlyr1aLqpgysCmmG9LS09r07GItjk=",
+        "owner": "bitemyapp",
+        "repo": "yukimi",
+        "rev": "9f42aaad4ce43457b057b9a135ac130e53cf9457",
+        "type": "github"
+      },
+      "original": {
+        "owner": "bitemyapp",
+        "ref": "stable",
+        "repo": "yukimi",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

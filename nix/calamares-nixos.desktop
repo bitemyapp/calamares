@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Install NixOS (Rust)
+Comment=Install NixOS with Determinate Nix
+Exec=calamares-nixos
+Icon=system-software-install
+Terminal=false
+Categories=System;

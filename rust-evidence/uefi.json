@@ -1,0 +1,9 @@
+{
+  "backend": "nix-package",
+  "firmware": "uefi",
+  "iso_sha256": "3dd85d328e420af4c88c016b45dc9c4f69460c82b7d628218371b17110676447",
+  "package": "/nix/store/f3h45hixda4zx0q87814gfrxz69in2rw-calamares-nixos-rust-0.1.0",
+  "passed": true,
+  "run": "uefi-1791074916109-48874",
+  "verification": "nix (Determinate Nix 3.23.0) 2.35.2\n\nfh 0.1.27\n\nPASS: installed system, password hash and PAM authentication, locked root, escaped configuration, desktop and Determinate services\n"
+}

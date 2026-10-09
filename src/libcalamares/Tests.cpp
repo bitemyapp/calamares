@@ -8,6 +8,7 @@
  *
  *
  */
+#include "partition/PartitionSize.h"
 
 #include "GlobalStorage.h"
 #include "JobQueue.h"
@@ -660,7 +661,6 @@ TestLibCalamares::testJobQueue()
         }
     }
 }
-
 
 QTEST_GUILESS_MAIN( TestLibCalamares )
 

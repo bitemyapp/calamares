@@ -70,6 +70,23 @@ let
   };
 in
 {
+  # Yukimi's Discover offers this catalog, installed through
+  # calamares.applications, when Yukimi's module is imported (and is new
+  # enough to take catalogs). Not even an empty programs.yukimi otherwise:
+  # without the module that option doesn't exist.
+  imports = [
+    {
+      config = lib.optionalAttrs (options ? programs.yukimi.catalogs) {
+        programs.yukimi.catalogs = [
+          {
+            file = ./applications.json;
+            setting = "calamares.applications";
+            title = "Apps chosen when installing";
+          }
+        ];
+      };
+    }
+  ];
   options.calamares = {
     applications = lib.mkOption {
       type = lib.types.listOf (lib.types.enum (map (app: app.id) catalog));
@@ -98,18 +115,6 @@ in
       }
     ];
     environment.systemPackages = packages ++ launchers;
-    # Yukimi's Discover offers this catalog, installed through
-    # calamares.applications, when its module is imported (and is new enough
-    # to take catalogs).
-    programs.yukimi = lib.optionalAttrs (options ? programs.yukimi.catalogs) {
-      catalogs = [
-        {
-          file = ./applications.json;
-          setting = "calamares.applications";
-          title = "Apps chosen when installing";
-        }
-      ];
-    };
     environment.etc."installer-applications.json".text = builtins.toJSON {
       selected = ids;
       packages = map (package: {

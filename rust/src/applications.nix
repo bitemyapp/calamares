@@ -4,6 +4,7 @@
 # installed flake.lock.
 {
   config,
+  options,
   lib,
   pkgs,
   applicationPkgs ? pkgs,
@@ -40,6 +41,33 @@ let
       ];
     }
   ) (builtins.filter (app: app ? terminal && app.id != "neovim") selected);
+  # Without defaults, whichever installed program claims a type opens it:
+  # the ChatGPT app claims web links and Office documents.
+  browsers = {
+    firefox = "firefox.desktop";
+    chromium = "chromium-browser.desktop";
+    google-chrome = "google-chrome.desktop";
+  };
+  # In the catalog's order.
+  browser = lib.findFirst has null [
+    "firefox"
+    "chromium"
+    "google-chrome"
+  ];
+  office = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document" = "writer.desktop";
+    "application/msword" = "writer.desktop";
+    "application/vnd.oasis.opendocument.text" = "writer.desktop";
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" = "calc.desktop";
+    "application/vnd.ms-excel" = "calc.desktop";
+    "application/vnd.ms-excel.sheet.macroEnabled.12" = "calc.desktop";
+    "application/vnd.oasis.opendocument.spreadsheet" = "calc.desktop";
+    "text/csv" = "calc.desktop";
+    "text/tab-separated-values" = "calc.desktop";
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation" = "impress.desktop";
+    "application/vnd.ms-powerpoint" = "impress.desktop";
+    "application/vnd.oasis.opendocument.presentation" = "impress.desktop";
+  };
 in
 {
   options.calamares = {
@@ -70,6 +98,18 @@ in
       }
     ];
     environment.systemPackages = packages ++ launchers;
+    # Yukimi's Discover offers this catalog, installed through
+    # calamares.applications, when its module is imported (and is new enough
+    # to take catalogs).
+    programs.yukimi = lib.optionalAttrs (options ? programs.yukimi.catalogs) {
+      catalogs = [
+        {
+          file = ./applications.json;
+          setting = "calamares.applications";
+          title = "Apps chosen when installing";
+        }
+      ];
+    };
     environment.etc."installer-applications.json".text = builtins.toJSON {
       selected = ids;
       packages = map (package: {
@@ -85,6 +125,18 @@ in
         path = package;
       }) (packages ++ launchers)
     );
+    # The first selected browser opens links, LibreOffice opens documents;
+    # each user can still choose others.
+    xdg.mime.defaultApplications =
+      lib.optionalAttrs (browser != null) (
+        lib.genAttrs [
+          "text/html"
+          "application/xhtml+xml"
+          "x-scheme-handler/http"
+          "x-scheme-handler/https"
+        ] (_: browsers.${browser})
+      )
+      // lib.optionalAttrs (has "libreoffice") office;
     programs.firefox = lib.mkIf (has "firefox") {
       enable = true;
       package = applicationPkgs.firefox;
@@ -100,6 +152,12 @@ in
         setSocketVariable = true;
       };
     };
+    # For people only: nixpkgs excludes just root, so the login screen's
+    # user manager (and other system users') started Docker at boot, where it
+    # cannot run and retried until rate-limited.
+    systemd.user.services.docker.unitConfig.ConditionUser = lib.mkIf (has "docker") (
+      lib.mkForce "!@system"
+    );
     users.users.${config.calamares.installUser}.linger = lib.mkIf (has "docker") true;
   };
 }

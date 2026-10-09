@@ -63,6 +63,7 @@ name = "calamares-nixos"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64ct",
  "gio",
  "glib",
  "gtk4",
@@ -71,6 +72,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha-crypt",
+ "sha2",
  "tempfile",
  "zeroize",
 ]

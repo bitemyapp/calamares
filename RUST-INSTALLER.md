@@ -13,10 +13,20 @@ The new implementation is GPL-3.0-or-later. It has no upstream endorsement.
 ## Supported first-release workflow
 
 - x86_64 NixOS live ISO; network connection required. The live desktop is Plasma.
-- Multi-select installed desktops: Plasma (default), GNOME, Xfce, Cinnamon,
-  MATE, LXQt, vanilla Hyprland and an Omarchy-style Hyprland, with an explicit
-  default login session. GNOME and Cinnamon cannot be combined because the
-  pinned NixOS modules conflict on GSettings.
+- Multi-select installed desktops: the Wayland desktops Plasma (default),
+  GNOME, vanilla Hyprland and Tatami (a Hyprland desktop inspired by Omarchy),
+  and Xfce as the one X11 desktop, with an explicit default login session.
+  MATE, LXQt and Cinnamon are no longer offered; the NixOS module still
+  accepts them, so systems installed with them keep working.
+- Every desktop offers Tatami's wallpapers from one copy of each image, and
+  starts with its own: the ocean wave in Plasma (a Breeze Global Theme with
+  that wallpaper), the foggy forest in GNOME, the mountains at dusk in Xfce
+  (xfdesktop built with it as the default backdrop) and Da Nang at night in
+  Tatami.
+- Every desktop includes [Yukimi](https://github.com/bitemyapp/yukimi), the
+  app for seeing what is installed, finding and installing packages,
+  updating, returning to an earlier generation and cleaning up the store,
+  without editing configuration.
 - Guided erase of one whole disk, GPT, ext4 (default), Btrfs or XFS, EFI/systemd-boot or BIOS/GRUB.
 - A swap partition matched to installed RAM, with zswap and hibernation resume
   (default on), and CachyOS-inspired kernel, memory, I/O and service defaults
@@ -27,6 +37,9 @@ The new implementation is GPL-3.0-or-later. It has no upstream endorsement.
 - Hostname, normal user with sudo, password, full name, time zone, a selection
   of eight system locales and keyboard layouts. Allowing unfree packages is
   enabled by default, with an explicit checkbox opt-out and review summary.
+- An optional GitHub step: the public SSH keys of a GitHub account as the
+  user's authorized keys, the OpenSSH server, and Git's name and email address
+  (see [GitHub, SSH and Git](#github-ssh-and-git)).
 - Pinned Nixpkgs, Determinate Nix and `fh` inputs supplied by the installation
   media. The installed system keeps the same lock file.
 
@@ -36,6 +49,37 @@ translations are implemented. The GUI says this before offering installation.
 Treat this as an experimental, NixOS-focused fork; VM verification is not a
 guarantee for every physical machine. Do not erase irreplaceable data without a
 backup.
+
+### GitHub, SSH and Git
+
+The step after the account (`github.rs`, all optional) works like Ubuntu's
+server installer:
+
+- **SSH keys.** For a GitHub username, the GUI fetches
+  `https://github.com/USER.keys` over HTTPS (curl, TLS 1.2+, the media's CA
+  bundle) and lists each key's type and `SHA256:` fingerprint, as
+  `ssh-keygen -l` prints them. Keys the user allows become
+  `users.users.USER.openssh.authorizedKeys.keys`. Only the algorithm and the
+  base64 key are kept; each key must name the same algorithm inside as
+  outside, and types OpenSSH no longer accepts are left out and counted.
+- **SSH server.** A switch on the same page, not in the applications list,
+  enables `services.openssh` (open in the firewall). With keys authorized it
+  refuses passwords and keyboard-interactive login; with none, the account's
+  password is the only way in, so it is accepted.
+- **Git identity.** Name and email address for `programs.git.config.user`
+  (`/etc/gitconfig`, for every account; `git config --global` overrides it).
+  The name follows the account's full name, or the GitHub profile's name when
+  the account has none; a lookup fills in the profile's public address, or
+  GitHub's private commit address `ID+USER@users.noreply.github.com`. Fields
+  the user edits are left alone. Both are set, or neither.
+
+The GitHub username is the only thing sent, to github.com and to
+api.github.com for the profile; the profile is best effort (the API allows 60
+unauthenticated requests an hour). A username that was not looked up, or was
+changed after its lookup, cannot reach review: Next looks it up first. As with
+every other field, the helper parses the GitHub username, each key and the Git
+identity again from the request, and `configuration.nix` receives only the
+parsed values.
 
 ### Filesystems and storage verification
 
@@ -93,18 +137,39 @@ The upstream hardware generator still supplies detected storage, CPU microcode
 and device settings.
 
 NVIDIA GPUs use NVIDIA's own driver rather than nouveau (`rust/system/nvidia.nix`,
-`src/graphics.rs`). The GUI reads display controllers from sysfs and sends the
-first NVIDIA GPU's bus ID with the request; the helper accepts only well-formed
-bus IDs. On laptops (SMBIOS chassis types 8, 9, 10, 14, 31 and 32) with an
-Intel or AMD integrated GPU, the configuration adds PRIME offload: the
-integrated GPU drives the panel, `nvidia-offload` runs a program on the NVIDIA
-GPU, and fine-grained power management turns it off when idle. The driver is
-the latest release with open kernel modules, which support Turing and newer
-GPUs, the only ones the latest driver supports. Video memory is preserved
-across suspend and hibernation. The review page shows the choice. If unfree
-packages are declined, nouveau remains. The installation media carry the same
-driver build, so an installation copies it instead of downloading NVIDIA's
-installer and building it.
+`src/graphics.rs`). The GUI reads display controllers and connected displays
+from sysfs and sends the result with the request; the helper accepts only
+well-formed bus IDs. The driver is the latest release with open kernel modules,
+which support Turing and newer GPUs, the only ones the latest driver supports.
+Video memory is preserved across suspend and hibernation.
+
+Which GPU is primary follows where the displays are connected: the GPU above
+the connected eDP, LVDS or DSI panel connector in `/sys/class/drm`, otherwise
+the one with any connected display.
+
+- **Displays on the Intel or AMD GPU:** PRIME offload. `nvidia-offload` runs a
+  program on the NVIDIA GPU, and fine-grained power management turns it off
+  when idle.
+- **Displays on the NVIDIA GPU:** the NVIDIA GPU is primary. This covers a
+  laptop MUX switch in discrete mode, and a desktop's monitor on the graphics
+  card.
+- **No connected display visible:** laptops (SMBIOS chassis types 8, 9, 10, 14,
+  31 and 32) assume offload, and desktops assume the NVIDIA GPU.
+
+The choice matters only for X11 sessions (Xfce, and on older installations
+MATE, LXQt and Cinnamon). The login screen (GDM when GNOME is installed, Plasma
+Login Manager otherwise) and the Wayland desktops find the displays on any GPU
+by themselves. Under offload, X draws only on the
+integrated GPU; otherwise, only on the NVIDIA GPU. On an Acer Predator Helios
+Neo 14 with its MUX in discrete mode, offload under SDDM's X11 login screen
+left the screen black.
+`examples/detect-graphics.rs` prints the detection on any machine without
+privileges.
+
+The review page shows the choice. If unfree packages are declined, nouveau
+remains. The installation media carry the same driver build, so an
+installation copies it instead of downloading NVIDIA's installer and building
+it.
 
 Wi-Fi transfer is enabled by default, with an opt-out and a profile count on
 the review page. The GUI worker queries NetworkManager as the live user, so
@@ -262,12 +327,22 @@ reboot. The installer cannot promise rollback after a partition table is erased.
 
 The installed `/etc/nixos` contains only `flake.nix`, `flake.lock`,
 `configuration.nix` and `hardware-configuration.nix`. The desktop, Hyprland,
-Omarchy, swap/zswap, tuning and application modules come from the flake input
-`calamares`, which follows this repository's `stable` branch:
+swap/zswap, tuning and application modules come from the flake input
+`calamares`, which follows this repository's `stable` branch. The Tatami
+desktop comes from [its own repository](https://github.com/bitemyapp/tatami)
+through a `tatami` input, and Yukimi from
+[its own](https://github.com/bitemyapp/yukimi) through a `yukimi` input.
+`calamares` follows both, so each updates on its own schedule:
 
 ```nix
 inputs.calamares.url = "github:bitemyapp/calamares/stable";
 inputs.calamares.inputs.nixpkgs.follows = "nixpkgs";
+inputs.calamares.inputs.tatami.follows = "tatami";
+inputs.calamares.inputs.yukimi.follows = "yukimi";
+inputs.tatami.url = "github:bitemyapp/tatami/stable";
+inputs.tatami.inputs.nixpkgs.follows = "nixpkgs";
+inputs.yukimi.url = "github:bitemyapp/yukimi/stable";
+inputs.yukimi.inputs.nixpkgs.follows = "nixpkgs";
 # ...
 modules = [ determinate.nixosModules.default calamares.nixosModules.default ./configuration.nix ];
 ```
@@ -276,7 +351,7 @@ The installation records the exact revision on the media in `flake.lock`.
 Bug fixes then need no reinstall:
 
 ```sh
-sudo nix flake update calamares --flake /etc/nixos
+sudo nix flake update calamares tatami yukimi --flake /etc/nixos
 sudo nixos-rebuild boot --flake /etc/nixos   # then reboot
 ```
 
@@ -288,8 +363,9 @@ it.
 The flake also works without this installer: `nixosModules.default` (or
 `nixosModules.desktops` and `nixosModules.applications`) provides the
 `calamares.*` options: `desktops`, `defaultDesktop`, `tuning.enable`,
-`zswap.enable`, `applications` and `installUser`. `packages.x86_64-linux.omarchy`
-is the Omarchy-style session's helper.
+`zswap.enable`, `applications` and `installUser`, and imports Tatami's module
+from the `tatami` input (`programs.tatami.enable`). `packages.x86_64-linux.tatami`
+re-exports the Tatami session's helper.
 
 Systems installed before this layout carry copies under `/etc/nixos/calamares`
 and `/etc/nixos/applications.nix`. Convert one by adding the two input lines

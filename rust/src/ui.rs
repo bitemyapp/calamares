@@ -14,6 +14,7 @@ use calamares_nixos::{
     Desktop, Filesystem, Firmware, Hostname, InstallPlan, KEYBOARDS, LOCALES, RawRequest, Settings,
     Username,
     disk::{self, Disk, Layout},
+    github::{self, GitIdentity, GithubUser},
     install::{Event, Summary},
     memory::{self, MemInfo},
     precache,
@@ -34,7 +35,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use widgets::{badge, clock, disk_icon, duration, icon, size};
+use widgets::{badge, clock, disk_icon, duration, icon, property, size};
 
 /// Load the stylesheet and the icons shipped with the installer package.
 pub fn load_style() {
@@ -64,6 +65,7 @@ enum Message {
     Reviewed(u64, Result<(Box<Review>, Session), String>),
     Session(u64, Update),
     Zone(u64, Result<timezone::Detection, String>),
+    Github(u64, Result<github::Profile, String>),
     Warm {
         generation: u64,
         read: u64,
@@ -78,6 +80,7 @@ enum Step {
     Welcome,
     Disk,
     Account,
+    GitHub,
     Desktop,
     Applications,
     Location,
@@ -85,10 +88,11 @@ enum Step {
     Install,
 }
 impl Step {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Welcome,
         Self::Disk,
         Self::Account,
+        Self::GitHub,
         Self::Desktop,
         Self::Applications,
         Self::Location,
@@ -100,6 +104,7 @@ impl Step {
             Self::Welcome => "Welcome",
             Self::Disk => "Disk",
             Self::Account => "Account",
+            Self::GitHub => "GitHub",
             Self::Desktop => "Desktop",
             Self::Applications => "Applications",
             Self::Location => "Location",
@@ -112,6 +117,7 @@ impl Step {
             Self::Welcome => "Welcome",
             Self::Disk => "Choose a Disk",
             Self::Account => "Create Your Account",
+            Self::GitHub => "GitHub, SSH and Git",
             Self::Desktop => "Choose Your Desktops",
             Self::Applications => "Choose Applications",
             Self::Location => "Time Zone and Language",
@@ -124,6 +130,7 @@ impl Step {
             Self::Welcome => "go-home-symbolic",
             Self::Disk => "drive-harddisk-symbolic",
             Self::Account => "avatar-default-symbolic",
+            Self::GitHub => "network-server-symbolic",
             Self::Desktop => "video-display-symbolic",
             Self::Applications => "view-app-grid-symbolic",
             Self::Location => "mark-location-symbolic",
@@ -136,6 +143,7 @@ impl Step {
             Self::Welcome => "welcome",
             Self::Disk => "disk",
             Self::Account => "account",
+            Self::GitHub => "github",
             Self::Desktop => "desktop",
             Self::Applications => "applications",
             Self::Location => "location",
@@ -219,9 +227,23 @@ pub(crate) struct Review {
     swap: bool,
     tuning: bool,
     graphics: String,
+    ssh_keys: String,
+    ssh_server: String,
+    git: String,
 }
 impl Review {
     fn of(plan: &InstallPlan) -> Self {
+        let onboarding = plan.onboarding();
+        let ssh_keys = match (onboarding.keys().len(), onboarding.github()) {
+            (0, _) | (_, None) => "None".to_string(),
+            (1, Some(user)) => format!("1 key from github.com/{}", user.as_str()),
+            (n, Some(user)) => format!("{n} keys from github.com/{}", user.as_str()),
+        };
+        let ssh_server = match (onboarding.ssh_server(), onboarding.password_login()) {
+            (false, _) => "Not installed",
+            (true, false) => "OpenSSH, key-only login",
+            (true, true) => "OpenSSH, password login",
+        };
         Self {
             disk: plan.disk().clone(),
             firmware: plan.firmware(),
@@ -241,6 +263,12 @@ impl Review {
             swap: plan.swap(),
             tuning: plan.tuning(),
             graphics: plan.graphics().describe(plan.allow_unfree()),
+            ssh_keys,
+            ssh_server: ssh_server.into(),
+            git: onboarding.git().map_or_else(
+                || "Not set".into(),
+                |id| format!("{} <{}>", id.name(), id.email()),
+            ),
         }
     }
 }
@@ -259,6 +287,7 @@ struct Ui {
     activity_spinner: adw::Spinner,
     disk: DiskPage,
     account: AccountPage,
+    github: GithubPage,
     desktop: DesktopPage,
     apps: applications::ApplicationsPage,
     location: LocationPage,
@@ -274,6 +303,16 @@ struct Ui {
     scanning: Cell<bool>,
     username_edited: Cell<bool>,
     filling_username: Cell<bool>,
+    /// The last GitHub lookup that answered, for the username it was for.
+    github_profile: RefCell<Option<github::Profile>>,
+    github_epoch: Cell<u64>,
+    github_pending: Cell<Option<u64>>,
+    /// Next was pressed before the lookup: continue when it succeeds.
+    github_advance: Cell<bool>,
+    /// The Git fields follow the account and GitHub until edited.
+    git_name_edited: Cell<bool>,
+    git_email_edited: Cell<bool>,
+    filling_git: Cell<bool>,
     default_desktops: RefCell<Vec<Desktop>>,
     default_choice: Cell<Option<Desktop>>,
     updating_default: Cell<bool>,
@@ -321,6 +360,7 @@ pub fn build(app: &adw::Application) {
     let welcome = build_welcome();
     let (disk_widget, disk) = build_disk_page();
     let (account_widget, account) = build_account_page();
+    let (github_widget, github) = build_github_page();
     let (desktop_widget, desktop) = build_desktop_page();
     // The application page is built before the Ui that owns its callback.
     let changed_selection: Rc<RefCell<Option<Callback>>> = Rc::new(RefCell::new(None));
@@ -349,6 +389,7 @@ pub fn build(app: &adw::Application) {
     stack.add_named(&welcome, Some(Step::Welcome.name()));
     stack.add_named(&disk_widget, Some(Step::Disk.name()));
     stack.add_named(&account_widget, Some(Step::Account.name()));
+    stack.add_named(&github_widget, Some(Step::GitHub.name()));
     stack.add_named(&desktop_widget, Some(Step::Desktop.name()));
     stack.add_named(&apps.widget, Some(Step::Applications.name()));
     stack.add_named(&location_widget, Some(Step::Location.name()));
@@ -423,6 +464,7 @@ pub fn build(app: &adw::Application) {
         activity_spinner,
         disk,
         account,
+        github,
         desktop,
         apps,
         location,
@@ -438,6 +480,13 @@ pub fn build(app: &adw::Application) {
         scanning: Cell::new(false),
         username_edited: Cell::new(false),
         filling_username: Cell::new(false),
+        github_profile: RefCell::new(None),
+        github_epoch: Cell::new(0),
+        github_pending: Cell::new(None),
+        github_advance: Cell::new(false),
+        git_name_edited: Cell::new(false),
+        git_email_edited: Cell::new(false),
+        filling_git: Cell::new(false),
         default_desktops: RefCell::new(Vec::new()),
         default_choice: Cell::new(Some(Desktop::Plasma)),
         updating_default: Cell::new(false),
@@ -479,6 +528,7 @@ pub fn build(app: &adw::Application) {
     ui.connect();
     ui.sync_desktops();
     ui.update_layout();
+    ui.update_ssh_server();
     ui.go(Step::Welcome);
     let preview = preview_requested();
     if !preview {
@@ -674,6 +724,51 @@ impl Ui {
                 }
             }
         });
+        self.github.lookup.connect_clicked({
+            let f = with(Ui::lookup_github);
+            move |_| f()
+        });
+        self.github.username.connect_entry_activated({
+            let f = with(Ui::lookup_github);
+            move |_| f()
+        });
+        self.github.username.connect_changed({
+            let f = with(Ui::github_username_changed);
+            move |_| f()
+        });
+        for switch in [&self.github.authorize, &self.github.ssh_server] {
+            switch.connect_active_notify({
+                let f = with(Ui::update_ssh_server);
+                move |_| f()
+            });
+        }
+        // The Git name follows the full name until it is edited.
+        self.account.full_name.connect_changed({
+            let weak = Rc::downgrade(self);
+            move |_| {
+                if let Some(ui) = weak.upgrade()
+                    && !ui.git_name_edited.get()
+                {
+                    ui.fill_git(Some(&ui.git_name_suggestion()), None);
+                }
+            }
+        });
+        for (entry, email) in [
+            (&self.github.git_name, false),
+            (&self.github.git_email, true),
+        ] {
+            entry.connect_changed({
+                let weak = Rc::downgrade(self);
+                move |entry| {
+                    if let Some(ui) = weak.upgrade() {
+                        if !ui.filling_git.get() {
+                            ui.git_edited(email).set(!entry.text().is_empty());
+                        }
+                        ui.validate_git_live();
+                    }
+                }
+            });
+        }
         for card in &self.desktop.cards {
             card.connect_toggled({
                 let weak = Rc::downgrade(self);
@@ -888,7 +983,18 @@ impl Ui {
         let result = match self.step.get() {
             Step::Welcome => Ok(Step::Disk),
             Step::Disk => self.check_disk().map(|()| Step::Account),
-            Step::Account => self.check_account().map(|()| Step::Desktop),
+            Step::Account => self.check_account().map(|()| Step::GitHub),
+            Step::GitHub => {
+                // Look the account up first, then continue on success.
+                if self.github_pending.get().is_some() || self.github_needs_lookup() {
+                    self.github_advance.set(true);
+                    if self.github_pending.get().is_none() {
+                        self.lookup_github();
+                    }
+                    return;
+                }
+                self.check_github().map(|()| Step::Desktop)
+            }
             Step::Desktop => self.check_desktops().map(|()| Step::Applications),
             Step::Applications => Ok(Step::Location),
             Step::Location => {
@@ -1175,6 +1281,252 @@ impl Ui {
         }
     }
 
+    // ---- GitHub, SSH and Git ----------------------------------------------
+
+    fn git_edited(&self, email: bool) -> &Cell<bool> {
+        if email {
+            &self.git_email_edited
+        } else {
+            &self.git_name_edited
+        }
+    }
+
+    /// The GitHub username as typed; empty skips GitHub.
+    fn github_text(&self) -> String {
+        self.github.username.text().trim().to_string()
+    }
+
+    /// The last lookup answered for the username now in the field.
+    fn github_profile_current(&self) -> bool {
+        let text = self.github_text();
+        !text.is_empty()
+            && self
+                .github_profile
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| p.user.as_str().eq_ignore_ascii_case(&text))
+    }
+
+    fn github_needs_lookup(&self) -> bool {
+        let text = self.github_text();
+        !text.is_empty() && GithubUser::parse(&text).is_ok() && !self.github_profile_current()
+    }
+
+    fn lookup_github(self: &Rc<Self>) {
+        let text = self.github_text();
+        if text.is_empty() || self.github_profile_current() {
+            return;
+        }
+        let user = match GithubUser::parse(&text) {
+            Ok(user) => user,
+            Err(error) => {
+                self.github_advance.set(false);
+                self.github.username.add_css_class("error");
+                self.github.status.set_text(&error.to_string());
+                return;
+            }
+        };
+        self.github_epoch
+            .set(self.github_epoch.get().wrapping_add(1));
+        let epoch = self.github_epoch.get();
+        self.github_pending.set(Some(epoch));
+        self.github.spinner.set_visible(true);
+        self.github.lookup.set_sensitive(false);
+        self.github
+            .status
+            .set_text(&format!("Looking up {} on GitHub…", user.as_str()));
+        let send = self.send.clone();
+        thread::spawn(move || {
+            let result = github::fetch(&user).map_err(|e| format!("{e:#}"));
+            let _ = send.send(Message::Github(epoch, result));
+        });
+    }
+
+    /// Keys found for one username never apply to another.
+    fn github_username_changed(self: &Rc<Self>) {
+        let text = self.github_text();
+        let error = (!text.is_empty())
+            .then(|| GithubUser::parse(&text).err())
+            .flatten();
+        if error.is_some() {
+            self.github.username.add_css_class("error");
+        } else {
+            self.github.username.remove_css_class("error");
+        }
+        if self.github_pending.take().is_some() {
+            self.github_epoch
+                .set(self.github_epoch.get().wrapping_add(1));
+            self.github.spinner.set_visible(false);
+        }
+        self.github_advance.set(false);
+        let current = self
+            .github_profile_current()
+            .then(|| self.github_profile.borrow().clone())
+            .flatten();
+        match &current {
+            Some(profile) => self.show_github_profile(profile),
+            None => {
+                self.show_github_keys(&[]);
+                self.github.status.set_text(&match &error {
+                    Some(error) => error.to_string(),
+                    None if text.is_empty() => GITHUB_HINT.into(),
+                    None => "Press Enter or Look Up to fetch this account's public keys.".into(),
+                });
+            }
+        }
+        self.github
+            .lookup
+            .set_sensitive(!text.is_empty() && error.is_none() && current.is_none());
+        self.update_ssh_server();
+    }
+
+    fn show_github_keys(&self, keys: &[github::AuthorizedKey]) {
+        let page = &self.github;
+        for row in page.key_rows.borrow_mut().drain(..) {
+            page.keys.remove(&row);
+        }
+        for key in keys {
+            let row = property(key.kind());
+            row.set_subtitle(&key.fingerprint());
+            row.add_prefix(&icon("dialog-password-symbolic"));
+            page.keys.add(&row);
+            page.key_rows.borrow_mut().push(row);
+        }
+        page.keys.set_visible(!keys.is_empty());
+    }
+
+    fn show_github_profile(&self, profile: &github::Profile) {
+        self.show_github_keys(&profile.keys);
+        let login = profile.user.as_str();
+        let mut status = match profile.keys.len() {
+            0 => format!("github.com/{login} has no public SSH keys."),
+            1 => format!("Found 1 public SSH key on github.com/{login}."),
+            n => format!("Found {n} public SSH keys on github.com/{login}."),
+        };
+        if profile.skipped > 0 {
+            status.push_str(&format!(
+                " {} of a type OpenSSH does not accept left out.",
+                profile.skipped
+            ));
+        }
+        self.github.status.set_text(&status);
+    }
+
+    /// The account's full name, or the GitHub profile's when it has none: a
+    /// name typed into this installer wins over a profile's display name.
+    fn git_name_suggestion(&self) -> String {
+        let typed = self.account.full_name.text().trim().to_string();
+        if !typed.is_empty() || !self.github_profile_current() {
+            return typed;
+        }
+        self.github_profile
+            .borrow()
+            .as_ref()
+            .and_then(|p| p.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// Fill the Git fields that the user has not edited.
+    fn fill_git(&self, name: Option<&str>, email: Option<&str>) {
+        self.filling_git.set(true);
+        if let Some(name) = name.filter(|_| !self.git_name_edited.get()) {
+            self.github.git_name.set_text(name);
+        }
+        if let Some(email) = email.filter(|_| !self.git_email_edited.get()) {
+            self.github.git_email.set_text(email);
+        }
+        self.filling_git.set(false);
+    }
+
+    /// Git's name and address for the request. A name filled in from the
+    /// account alone, with no address, means no identity.
+    fn git_fields(&self) -> (String, String) {
+        let name = self.github.git_name.text().trim().to_string();
+        let email = self.github.git_email.text().trim().to_string();
+        if email.is_empty() && !self.git_name_edited.get() {
+            (String::new(), String::new())
+        } else {
+            (name, email)
+        }
+    }
+
+    fn validate_git_live(&self) {
+        let page = &self.github;
+        for (row, bad) in [
+            (
+                &page.git_name,
+                GitIdentity::parse(&page.git_name.text(), "git@example.com").is_err(),
+            ),
+            (
+                &page.git_email,
+                GitIdentity::parse("Git", &page.git_email.text()).is_err(),
+            ),
+        ] {
+            if bad && !row.text().trim().is_empty() {
+                row.add_css_class("error");
+            } else {
+                row.remove_css_class("error");
+            }
+        }
+    }
+
+    /// The GitHub account and the keys to authorize, as the request lists them.
+    fn github_request(&self) -> (String, Vec<String>) {
+        if !self.github_profile_current() {
+            return (String::new(), vec![]);
+        }
+        let profile = self.github_profile.borrow();
+        let Some(profile) = profile.as_ref() else {
+            return (String::new(), vec![]);
+        };
+        let keys = if self.github.authorize.is_active() {
+            profile.keys.iter().map(|k| k.text()).collect()
+        } else {
+            vec![]
+        };
+        (profile.user.as_str().into(), keys)
+    }
+
+    fn update_ssh_server(self: &Rc<Self>) {
+        self.github
+            .ssh_server
+            .set_subtitle(if self.github_request().1.is_empty() {
+                "OpenSSH, open in the firewall. With no authorized keys it accepts your account's password."
+            } else {
+                "OpenSSH, open in the firewall. Only your GitHub keys can log in: passwords are refused."
+            });
+    }
+
+    fn check_github(&self) -> Result<(), String> {
+        let page = &self.github;
+        let text = self.github_text();
+        if !text.is_empty() {
+            if let Err(error) = GithubUser::parse(&text) {
+                page.username.add_css_class("error");
+                page.username.grab_focus();
+                return Err(error.to_string());
+            }
+            if !self.github_profile_current() {
+                page.username.grab_focus();
+                return Err(
+                    "Look up the GitHub account, or clear its username to skip GitHub.".into(),
+                );
+            }
+        }
+        let (name, email) = self.git_fields();
+        if let Err(error) = GitIdentity::parse(&name, &email) {
+            let row = if name.is_empty() || GitIdentity::parse(&name, "git@example.com").is_err() {
+                &page.git_name
+            } else {
+                &page.git_email
+            };
+            row.add_css_class("error");
+            row.grab_focus();
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+
     // ---- Desktops ---------------------------------------------------------
 
     fn selected_desktops(&self) -> Vec<Desktop> {
@@ -1212,20 +1564,12 @@ impl Ui {
         }
         *self.default_desktops.borrow_mut() = selected.clone();
         self.updating_default.set(false);
-        self.desktop.conflict.set_visible(
-            selected.contains(&Desktop::Gnome) && selected.contains(&Desktop::Cinnamon),
-        );
     }
 
     fn check_desktops(&self) -> Result<(), String> {
         let selected = self.selected_desktops();
         if selected.is_empty() {
             return Err("Select at least one desktop environment.".into());
-        }
-        if selected.contains(&Desktop::Gnome) && selected.contains(&Desktop::Cinnamon) {
-            return Err(
-                "GNOME and Cinnamon cannot be installed together. Deselect one of them.".into(),
-            );
         }
         Ok(())
     }
@@ -1392,9 +1736,10 @@ impl Ui {
         let checks = [
             self.check_disk(),
             self.check_account(),
+            self.check_github(),
             self.check_desktops(),
         ];
-        let targets = [Step::Disk, Step::Account, Step::Desktop];
+        let targets = [Step::Disk, Step::Account, Step::GitHub, Step::Desktop];
         for (check, step) in checks.into_iter().zip(targets) {
             if let Err(message) = check {
                 self.go(step);
@@ -1415,6 +1760,8 @@ impl Ui {
             self.go(Step::Disk);
             return;
         };
+        let (github_user, ssh_keys) = self.github_request();
+        let (git_name, git_email) = self.git_fields();
         let request = RawRequest {
             confirmation: String::new(),
             disk: disk.identity,
@@ -1442,6 +1789,11 @@ impl Ui {
             swap: self.disk.swap.is_active(),
             tuning: self.disk.tuning.is_active(),
             graphics: calamares_nixos::graphics::Graphics::detect(),
+            github_user,
+            ssh_keys,
+            ssh_server: self.github.ssh_server.is_active(),
+            git_name,
+            git_email,
         };
         self.stop_warm();
         self.reviewing.set(true);
@@ -1565,6 +1917,9 @@ impl Ui {
         } else {
             format!("{} ({})", review.full_name, review.username)
         });
+        r.ssh_keys.set_subtitle(&review.ssh_keys);
+        r.ssh_server.set_subtitle(&review.ssh_server);
+        r.git.set_subtitle(&review.git);
         r.locale.set_subtitle(&review.locale);
         r.zone.set_subtitle(
             &self
@@ -1886,6 +2241,34 @@ impl Ui {
                         }
                     }
                     Err(error) => self.location.status.set_text(&error),
+                }
+            }
+            Message::Github(epoch, result) => {
+                // Superseded by an edit or a newer lookup.
+                if self.github_pending.get() != Some(epoch) {
+                    return;
+                }
+                self.github_pending.set(None);
+                self.github.spinner.set_visible(false);
+                let advance = self.github_advance.replace(false);
+                match result {
+                    Ok(profile) => {
+                        let email = profile.email.clone();
+                        self.show_github_profile(&profile);
+                        *self.github_profile.borrow_mut() = Some(profile);
+                        self.fill_git(Some(&self.git_name_suggestion()), email.as_deref());
+                        self.update_ssh_server();
+                        if advance && self.step.get() == Step::GitHub {
+                            self.forward();
+                        }
+                    }
+                    Err(error) => {
+                        self.github.lookup.set_sensitive(true);
+                        self.github.status.set_text(&error);
+                        if advance {
+                            self.toast(&error);
+                        }
+                    }
                 }
             }
             Message::Warm {

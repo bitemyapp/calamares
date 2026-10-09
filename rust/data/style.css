@@ -180,11 +180,8 @@ button.card.desktop-card:checked:hover {
 .monogram-plasma { background-image: linear-gradient(135deg, #3daee9, #1d6fa5); }
 .monogram-gnome { background-image: linear-gradient(135deg, #62a0ea, #1a5fb4); }
 .monogram-xfce { background-image: linear-gradient(135deg, #5294e2, #2a5c9a); }
-.monogram-cinnamon { background-image: linear-gradient(135deg, #f6a35c, #c64600); }
-.monogram-mate { background-image: linear-gradient(135deg, #a3c76b, #5d8a2c); }
-.monogram-lxqt { background-image: linear-gradient(135deg, #46c1e0, #0c7aa6); }
 .monogram-hyprland { background-image: linear-gradient(135deg, #33ccff, #00b37a); }
-.monogram-omarchy { background-image: linear-gradient(135deg, #7aa2f7, #2b2f4a); }
+.monogram-tatami { background-image: linear-gradient(135deg, #7aa2f7, #2b2f4a); }
 
 /* Small pills for application traits. */
 .badge {

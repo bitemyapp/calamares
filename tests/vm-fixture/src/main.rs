@@ -16,6 +16,9 @@ use std::{
 };
 
 const PASSWORD: &str = "Qemu-Only-Test-123!";
+/// A throwaway public key standing in for one fetched from GitHub.
+const TEST_SSH_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF8y4b2kcB5eEPbrb5tU80+lphiIk3o7v09PPFOqRtH3";
 // Public synthetic network, no real wireless credentials or host NM access.
 const TEST_WIFI: &str = "[connection]\nid=Installer synthetic WiFi\nuuid=135ea3d9-d456-44b1-ae42-1e7081f66666\ntype=wifi\npermissions=user:nixos:;\n[wifi]\nssid=Installer synthetic WiFi\nmode=infrastructure\n[wifi-security]\nkey-mgmt=wpa-psk\npsk=WiFi-Synthetic-Only-123!\npsk-flags=0\n[ipv4]\nmethod=auto\n[ipv6]\nmethod=auto\n";
 // The host-side matrix now exercises the same parser as installation. Use real
@@ -228,8 +231,27 @@ fn request() -> Result<RawRequest> {
         swap: flag("CALAMARES_TEST_SWAP"),
         tuning: flag("CALAMARES_TEST_TUNING"),
         graphics: Default::default(),
+        github_user: github_field("rust-test"),
+        ssh_keys: github_test()
+            .then(|| TEST_SSH_KEY.into())
+            .into_iter()
+            .collect(),
+        ssh_server: github_test(),
+        git_name: github_field("Rust ${literal} Test"),
+        git_email: github_field("rusttest@example.com"),
         confirmation: format!("ERASE {}", disk::vm_test_disk()?.path),
     })
+}
+/// The GitHub step's keys, SSH server and Git identity (CALAMARES_TEST_GITHUB).
+fn github_test() -> bool {
+    flag("CALAMARES_TEST_GITHUB")
+}
+fn github_field(value: &str) -> String {
+    if github_test() {
+        value.into()
+    } else {
+        String::new()
+    }
 }
 fn seed_previous_filesystem(device: &str) -> Result<()> {
     let previous =
@@ -333,15 +355,12 @@ fn main() -> Result<()> {
                 false,
             ));
         } else {
-            for bits in 1u16..256 {
+            for bits in 1u16..(1 << Desktop::ALL.len()) {
                 let desktops: Vec<_> = Desktop::ALL
                     .iter()
                     .enumerate()
                     .filter_map(|(i, d)| (bits & (1 << i) != 0).then_some(*d))
                     .collect();
-                if desktops.contains(&Desktop::Gnome) && desktops.contains(&Desktop::Cinnamon) {
-                    continue;
-                }
                 let name = desktops
                     .iter()
                     .map(|d| d.id())
@@ -357,6 +376,9 @@ fn main() -> Result<()> {
         }
         let mut configs = std::collections::BTreeMap::new();
         for (name, desktops, applications, allow_unfree) in cases {
+            // The all-inclusive case also takes every GitHub step option.
+            let github = name == "all";
+            let text = |value: &str| if github { value.into() } else { String::new() };
             let r = RawRequest {
                 disk: disk::Identity {
                     path: "/dev/vda".into(),
@@ -384,6 +406,11 @@ fn main() -> Result<()> {
                 swap: true,
                 tuning: true,
                 graphics: Default::default(),
+                github_user: text("alice"),
+                ssh_keys: github.then(|| TEST_SSH_KEY.into()).into_iter().collect(),
+                ssh_server: github,
+                git_name: text("Alice"),
+                git_email: text("alice@example.com"),
                 confirmation: "ERASE /dev/vda".into(),
             };
             configs.insert(
@@ -507,9 +534,19 @@ fn main() -> Result<()> {
                 "unknown-application",
                 "unfree-application",
                 "duplicate-application",
+                "ssh-key",
+                "github-user",
             ] {
                 let mut bad = request()?;
                 match invalid {
+                    "ssh-key" => {
+                        bad.github_user = "rust-test".into();
+                        bad.ssh_keys = vec!["ssh-ed25519 AAAA\nssh-rsa AAAA".into()];
+                    }
+                    "github-user" => {
+                        bad.github_user = "rust_test".into();
+                        bad.ssh_keys = vec![TEST_SSH_KEY.into()];
+                    }
                     "username" => bad.username = "root".into(),
                     "desktops" => bad.desktops.clear(),
                     "wifi" => bad.copy_wifi = false,
@@ -685,6 +722,28 @@ fn main() -> Result<()> {
                 configuration.contains("nixpkgs.config.allowUnfree = true;"),
                 "Installed hardware-friendly unfree default missing"
             );
+            if github_test() {
+                ensure!(
+                    fs::read_to_string("/etc/ssh/authorized_keys.d/rusttest")?
+                        .lines()
+                        .any(|line| line == TEST_SSH_KEY),
+                    "The GitHub key is not authorized for the installed user"
+                );
+                output("systemctl", &["is-active", "sshd.service"], 30)?;
+                let sshd = output("sshd", &["-T"], 30)?;
+                ensure!(
+                    sshd.lines().any(|l| l == "passwordauthentication no"),
+                    "The SSH server accepts passwords although keys are authorized"
+                );
+                ensure!(
+                    output("git", &["config", "--system", "user.name"], 10)?.trim()
+                        == "Rust ${literal} Test"
+                        && output("git", &["config", "--system", "user.email"], 10)?.trim()
+                            == "rusttest@example.com",
+                    "The Git identity is not configured"
+                );
+                println!("GITHUB=authorized key, key-only sshd, Git identity");
+            }
             output(
                 "busctl",
                 &[

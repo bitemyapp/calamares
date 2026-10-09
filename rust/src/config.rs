@@ -2,8 +2,7 @@
 //! NixOS option semantics adapted from calamares-nixos-extensions 0.3.23.
 //! No Python/C++ module or global-storage hooks are executed by this installer.
 use crate::{
-    Firmware, Hostname, InstallPlan, Kernel, Settings, filesystem::Identities, graphics::Offload,
-    read_trusted,
+    Firmware, Hostname, InstallPlan, Kernel, Settings, filesystem::Identities, read_trusted,
 };
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeSet, fs, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
@@ -17,9 +16,10 @@ pub fn nix_string(value: &str) -> String {
 }
 
 /// Inputs of the installed flake. `calamares` provides the system modules
-/// (desktops, tuning, Hyprland, Omarchy and applications) from its `stable`
-/// branch, so fixes arrive with `nix flake update` instead of a reinstall.
-const TARGET_INPUTS: [&str; 7] = [
+/// (desktops, tuning, Hyprland, Tatami, Yukimi and applications) from its
+/// `stable` branch, so fixes arrive with `nix flake update` instead of a
+/// reinstall.
+const TARGET_INPUTS: [&str; 9] = [
     "nixpkgs",
     "determinate",
     "fh",
@@ -27,6 +27,8 @@ const TARGET_INPUTS: [&str; 7] = [
     "ai-apps",
     "omp",
     "calamares",
+    "tatami",
+    "yukimi",
 ];
 
 pub struct Template {
@@ -141,16 +143,17 @@ pub fn configuration(request: &InstallPlan, ids: &Identities) -> Result<String> 
             let mut text = String::from(
                 "  # NVIDIA's driver (latest release, open kernel modules) instead of nouveau.\n  calamares.nvidia.enable = true;\n",
             );
-            if let Some(offload) = &request.graphics().offload {
-                let (key, id) = match offload {
-                    Offload::Intel(id) => ("intelBusId", id),
-                    Offload::Amd(id) => ("amdgpuBusId", id),
-                };
-                text.push_str(&format!(
-                    "  # Laptop: the integrated GPU drives the panel; run programs on the NVIDIA GPU with nvidia-offload.\n  calamares.nvidia.prime = {{ nvidiaBusId = {}; {key} = {}; }};\n",
+            match (&request.graphics().integrated, request.graphics().offload) {
+                (Some(gpu), true) => text.push_str(&format!(
+                    "  # The displays are on the integrated GPU; nvidia-offload runs a program on the NVIDIA GPU.\n  calamares.nvidia.prime = {{ nvidiaBusId = {}; {} = {}; }};\n",
                     q(nvidia),
-                    q(id)
-                ));
+                    gpu.option(),
+                    q(gpu.bus_id())
+                )),
+                (Some(_), false) => text.push_str(
+                    "  # The displays are on the NVIDIA GPU, so it is the primary GPU.\n",
+                ),
+                (None, _) => {}
             }
             text
         }
@@ -159,6 +162,36 @@ pub fn configuration(request: &InstallPlan, ids: &Identities) -> Result<String> 
         }
         (None, _) => String::new(),
     };
+    // The GitHub step: authorized keys, the SSH server and a Git identity.
+    let onboarding = request.onboarding();
+    let authorized_keys = match onboarding.github() {
+        Some(user) if !onboarding.keys().is_empty() => format!(
+            "    # Public SSH keys of github.com/{}, fetched during installation.\n    openssh.authorizedKeys.keys = [\n{}    ];\n",
+            user.as_str(),
+            onboarding
+                .keys()
+                .iter()
+                .map(|key| format!("      {}\n", q(&key.text())))
+                .collect::<String>()
+        ),
+        _ => String::new(),
+    };
+    let ssh = match (onboarding.ssh_server(), onboarding.password_login()) {
+        (false, _) => "",
+        (true, false) => {
+            "  # The SSH server, for the authorized keys only: passwords are refused.\n  services.openssh = {\n    enable = true;\n    settings.PasswordAuthentication = false;\n    settings.KbdInteractiveAuthentication = false;\n  };\n"
+        }
+        (true, true) => {
+            "  # The SSH server, with password login: no keys were authorized.\n  services.openssh.enable = true;\n"
+        }
+    };
+    let git = onboarding.git().map_or_else(String::new, |identity| {
+        format!(
+            "  # Git's name and address for commits, for every account (/etc/gitconfig);\n  # `git config --global` sets your own.\n  programs.git = {{\n    enable = true;\n    config.user = {{ name = {}; email = {}; }};\n  }};\n",
+            q(identity.name()),
+            q(identity.email())
+        )
+    });
     let diagnostic = if settings.test_diagnostics {
         "  # Disposable QEMU verification only.\n  services.qemuGuest.enable = true;\n  boot.kernelParams = [ \"console=ttyS0,115200n8\" \"console=tty0\" ];\n"
     } else {
@@ -197,8 +230,8 @@ pub fn configuration(request: &InstallPlan, ids: &Identities) -> Result<String> 
     extraGroups = [ "networkmanager" "wheel" ];
     # A root-only file on the target, never a Nix store source path.
     hashedPasswordFile = "/etc/nixos-secrets/user-password.hash";
-  }};
-  nixpkgs.config.allowUnfree = {unfree};
+{authorized_keys}  }};
+{ssh}{git}  nixpkgs.config.allowUnfree = {unfree};
   system.stateVersion = {state};
 {diagnostic}}}
 "#,
@@ -259,21 +292,8 @@ mod tests {
     /// The installation media prebuild rust/reference.nix so installations
     /// find their packages already present. Settings that affect which
     /// packages an installed system contains must match between the two.
-    #[test]
-    fn reference_system_shares_closure_relevant_settings() {
-        let squash = |text: &str| text.split_whitespace().collect::<String>();
-        let reference = squash(include_str!("../reference.nix"));
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("Etc")).unwrap();
-        std::fs::write(dir.path().join("Etc/UTC"), "TZif").unwrap();
-        let settings = Settings {
-            template_dir: "/unused".into(),
-            zoneinfo: dir.path().to_string_lossy().into_owned(),
-            state_version: "26.11".into(),
-            kernel: Kernel::Latest,
-            test_diagnostics: false,
-        };
-        let plan = crate::RawRequest {
+    fn test_request() -> crate::RawRequest {
+        crate::RawRequest {
             disk: crate::disk::Identity {
                 path: "/dev/vda".into(),
                 major_minor: "252:0".into(),
@@ -300,16 +320,37 @@ mod tests {
             swap: true,
             tuning: true,
             graphics: Default::default(),
+            github_user: String::new(),
+            ssh_keys: vec![],
+            ssh_server: false,
+            git_name: String::new(),
+            git_email: String::new(),
             confirmation: String::new(),
         }
-        .parse(&settings)
-        .unwrap();
+    }
+    fn generate(request: crate::RawRequest) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Etc")).unwrap();
+        std::fs::write(dir.path().join("Etc/UTC"), "TZif").unwrap();
+        let settings = Settings {
+            template_dir: "/unused".into(),
+            zoneinfo: dir.path().to_string_lossy().into_owned(),
+            state_version: "26.11".into(),
+            kernel: Kernel::Latest,
+            test_diagnostics: false,
+        };
         let ids = Identities {
             root: "00000000-0000-4000-8000-000000000000".into(),
             efi: Some("0000-0000".into()),
             swap: Some("00000000-0000-4000-8000-000000000001".into()),
         };
-        let generated = squash(&configuration(&plan, &ids).unwrap());
+        configuration(&request.parse(&settings).unwrap(), &ids).unwrap()
+    }
+    #[test]
+    fn reference_system_shares_closure_relevant_settings() {
+        let squash = |text: &str| text.split_whitespace().collect::<String>();
+        let reference = squash(include_str!("../reference.nix"));
+        let generated = squash(&generate(test_request()));
         for fragment in [
             "calamares.applications=",
             "calamares.desktops=",
@@ -337,6 +378,35 @@ mod tests {
                 "reference.nix lacks {fragment}"
             );
         }
+    }
+    #[test]
+    fn github_step_writes_keys_server_and_git_identity() {
+        const KEY: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF8y4b2kcB5eEPbrb5tU80+lphiIk3o7v09PPFOqRtH3";
+        let plain = generate(test_request());
+        for absent in ["openssh", "programs.git", "github.com/"] {
+            assert!(!plain.contains(absent), "{absent} without the GitHub step");
+        }
+        let mut request = test_request();
+        request.github_user = "ada-l".into();
+        request.ssh_keys = vec![format!("{KEY} ada@laptop")];
+        request.ssh_server = true;
+        request.git_name = "Ada \"${x}\" Lovelace".into();
+        request.git_email = "ada@example.com".into();
+        let text = generate(request);
+        assert!(text.contains(&format!(
+            "    # Public SSH keys of github.com/ada-l, fetched during installation.\n    openssh.authorizedKeys.keys = [\n      \"{KEY}\"\n    ];\n  }};\n"
+        )));
+        assert!(text.contains("settings.PasswordAuthentication = false;"));
+        assert!(text.contains(
+            "config.user = { name = \"Ada \\\"\\${x}\\\" Lovelace\"; email = \"ada@example.com\"; };"
+        ));
+        // Without keys the server accepts passwords: the only way to log in.
+        let mut request = test_request();
+        request.ssh_server = true;
+        let text = generate(request);
+        assert!(text.contains("  services.openssh.enable = true;\n"));
+        assert!(!text.contains("PasswordAuthentication") && !text.contains("authorizedKeys"));
     }
     #[test]
     fn secrets_are_exclusive_and_private() {

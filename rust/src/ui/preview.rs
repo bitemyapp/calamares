@@ -2,8 +2,8 @@
 //! Debug builds only: render a page with sample data for screenshots outside
 //! the live ISO. Never compiled into release builds and never touches disks.
 //!
-//! `CALAMARES_UI_PREVIEW=welcome|disk|account|desktop|applications|location|
-//! review|ready|prepfail|install|done|failed`
+//! `CALAMARES_UI_PREVIEW=welcome|disk|account|github|desktop|applications|
+//! location|review|ready|prepfail|install|done|failed`
 use super::*;
 
 fn sample_disk(path: &str, model: &str, gib: u64, serial: &str, blocked: Option<&str>) -> Disk {
@@ -83,9 +83,30 @@ pub fn apply(ui: &Rc<Ui>) {
     ui.account.password.set_text("correct horse battery");
     ui.account.repeat.set_text("correct horse battery");
     ui.account.hostname.set_text("analytical-engine");
+    // A GitHub lookup as it answers, without the network. Sample keys only.
+    ui.github.username.set_text("adalovelace");
+    ui.github_pending.set(Some(ui.github_epoch.get()));
+    ui.handle(Message::Github(
+        ui.github_epoch.get(),
+        Ok(github::Profile {
+            user: GithubUser::parse("adalovelace").unwrap(),
+            keys: [
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF8y4b2kcB5eEPbrb5tU80+lphiIk3o7v09PPFOqRtH3",
+                "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBFaKW8Z6YOoa5UaaVHwOgDXPe4PcYk663+2rvgwaCVo0QOYEMFJWQ4VZL6GKzJuSioxTotYTGYsKGOv45zDqz0A=",
+            ]
+            .iter()
+            .map(|key| github::AuthorizedKey::parse(key).unwrap())
+            .collect(),
+            skipped: 0,
+            name: Some("Ada Lovelace".into()),
+            email: Some("1815+adalovelace@users.noreply.github.com".into()),
+            private_email: true,
+        }),
+    ));
+    ui.github.ssh_server.set_active(true);
     ui.desktop.cards[Desktop::ALL
         .iter()
-        .position(|d| *d == Desktop::Omarchy)
+        .position(|d| *d == Desktop::Tatami)
         .unwrap()]
     .set_active(true);
     if let Some(index) = ui.zones.as_ref().and_then(|z| z.find("America/Chicago")) {
@@ -100,6 +121,7 @@ pub fn apply(ui: &Rc<Ui>) {
     let step = match page.as_str() {
         "disk" => Step::Disk,
         "account" => Step::Account,
+        "github" => Step::GitHub,
         "desktop" => Step::Desktop,
         "applications" => Step::Applications,
         "location" => Step::Location,
@@ -130,7 +152,7 @@ pub fn apply(ui: &Rc<Ui>) {
         locale: "en_US.UTF-8".into(),
         timezone: "America/Chicago".into(),
         keyboard: "us".into(),
-        desktops: vec![Desktop::Plasma, Desktop::Omarchy],
+        desktops: vec![Desktop::Plasma, Desktop::Tatami],
         default_desktop: Desktop::Plasma,
         applications: "Firefox, Ghostty, Development build tools, Rustup".into(),
         wifi: true,
@@ -140,11 +162,15 @@ pub fn apply(ui: &Rc<Ui>) {
         tuning: true,
         graphics: calamares_nixos::graphics::Graphics {
             nvidia: Some("PCI:1:0:0".into()),
-            offload: Some(calamares_nixos::graphics::Offload::Intel(
+            integrated: Some(calamares_nixos::graphics::Integrated::Intel(
                 "PCI:0:2:0".into(),
             )),
+            offload: false,
         }
         .describe(true),
+        ssh_keys: "2 keys from github.com/adalovelace".into(),
+        ssh_server: "OpenSSH, key-only login".into(),
+        git: "Ada Lovelace <1815+adalovelace@users.noreply.github.com>".into(),
     };
     ui.show_review(&review);
     ui.go(Step::Review);

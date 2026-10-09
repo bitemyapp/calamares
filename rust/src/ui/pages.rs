@@ -49,11 +49,23 @@ pub(super) struct AccountPage {
     pub(super) password_hint: Label,
 }
 
+pub(super) struct GithubPage {
+    pub(super) username: adw::EntryRow,
+    pub(super) lookup: gtk::Button,
+    pub(super) spinner: adw::Spinner,
+    pub(super) status: Label,
+    pub(super) keys: adw::PreferencesGroup,
+    pub(super) key_rows: RefCell<Vec<adw::ActionRow>>,
+    pub(super) authorize: adw::SwitchRow,
+    pub(super) ssh_server: adw::SwitchRow,
+    pub(super) git_name: adw::EntryRow,
+    pub(super) git_email: adw::EntryRow,
+}
+
 pub(super) struct DesktopPage {
     pub(super) cards: Vec<gtk::ToggleButton>,
     pub(super) default: adw::ComboRow,
     pub(super) default_model: gtk::StringList,
-    pub(super) conflict: Label,
     pub(super) wifi: adw::SwitchRow,
     pub(super) unfree: adw::SwitchRow,
 }
@@ -96,6 +108,9 @@ pub(super) struct ReviewPage {
     pub(super) wifi: adw::ActionRow,
     pub(super) computer: adw::ActionRow,
     pub(super) user: adw::ActionRow,
+    pub(super) ssh_keys: adw::ActionRow,
+    pub(super) ssh_server: adw::ActionRow,
+    pub(super) git: adw::ActionRow,
     pub(super) locale: adw::ActionRow,
     pub(super) zone: adw::ActionRow,
     pub(super) keyboard: adw::ActionRow,
@@ -373,6 +388,83 @@ pub(super) fn build_account_page() -> (adw::PreferencesPage, AccountPage) {
     )
 }
 
+/// Status line under the GitHub username before any lookup.
+pub(super) const GITHUB_HINT: &str = "Optional. Press Enter or Look Up to fetch the account's public keys. Leave it empty to skip GitHub.";
+
+pub(super) fn build_github_page() -> (adw::PreferencesPage, GithubPage) {
+    let page = adw::PreferencesPage::new();
+    let account = group(
+        "GitHub",
+        "Bring your public SSH keys from GitHub, as Ubuntu's server installer does, so you can log in to this computer with them.",
+    );
+    let username = adw::EntryRow::builder().title("GitHub username").build();
+    let spinner = adw::Spinner::new();
+    spinner.set_visible(false);
+    let lookup = gtk::Button::builder()
+        .label("Look Up")
+        .valign(Align::Center)
+        .sensitive(false)
+        .build();
+    lookup.add_css_class("flat");
+    username.add_suffix(&spinner);
+    username.add_suffix(&lookup);
+    account.add(&username);
+    let status = caption(GITHUB_HINT);
+    status.set_margin_top(10);
+    account.add(&status);
+    page.add(&account);
+
+    let keys = group(
+        "SSH Keys",
+        "Fetched from github.com. Only the public halves of your keys are shared.",
+    );
+    let authorize = adw::SwitchRow::builder()
+        .title("Allow these keys to log in")
+        .subtitle("Adds them to your account's authorized keys")
+        .active(true)
+        .build();
+    keys.add(&authorize);
+    keys.set_visible(false);
+    page.add(&keys);
+
+    let remote = group("Remote Login", "");
+    let ssh_server = adw::SwitchRow::builder()
+        .title("Install and enable the SSH server")
+        .build();
+    remote.add(&ssh_server);
+    page.add(&remote);
+
+    let git = group(
+        "Git",
+        "The name and email address recorded in your commits. Leave both empty to set them later.",
+    );
+    let git_name = adw::EntryRow::builder().title("Name").build();
+    let git_email = adw::EntryRow::builder().title("Email").build();
+    git.add(&git_name);
+    git.add(&git_email);
+    let git_hint = caption(
+        "Saved in /etc/gitconfig for every account on this computer; git config --global sets your own.",
+    );
+    git_hint.set_margin_top(10);
+    git.add(&git_hint);
+    page.add(&git);
+    (
+        page,
+        GithubPage {
+            username,
+            lookup,
+            spinner,
+            status,
+            keys,
+            key_rows: RefCell::new(Vec::new()),
+            authorize,
+            ssh_server,
+            git_name,
+            git_email,
+        },
+    )
+}
+
 pub(super) fn build_desktop_page() -> (adw::PreferencesPage, DesktopPage) {
     let page = adw::PreferencesPage::new();
     let environments = group(
@@ -397,13 +489,6 @@ pub(super) fn build_desktop_page() -> (adw::PreferencesPage, DesktopPage) {
         })
         .collect();
     environments.add(&flow);
-    let conflict = label(
-        "GNOME and Cinnamon cannot be installed together: their NixOS modules conflict on GSettings overrides. Choose one of them; every other combination works.",
-    );
-    conflict.add_css_class("error");
-    conflict.set_margin_top(12);
-    conflict.set_visible(false);
-    environments.add(&conflict);
     page.add(&environments);
     let login = group("Login", "");
     let default_model = gtk::StringList::new(&[]);
@@ -434,7 +519,6 @@ pub(super) fn build_desktop_page() -> (adw::PreferencesPage, DesktopPage) {
             cards,
             default,
             default_model,
-            conflict,
             wifi,
             unfree,
         },
@@ -697,6 +781,14 @@ pub(super) fn build_review_page() -> ReviewPage {
         account_group.add(row);
     }
     page.add(&account_group);
+    let github_group = group("GitHub, SSH and Git", "");
+    let ssh_keys = property("SSH keys");
+    let ssh_server = property("SSH server");
+    let git = property("Git identity");
+    for row in [&ssh_keys, &ssh_server, &git] {
+        github_group.add(row);
+    }
+    page.add(&github_group);
     ReviewPage {
         page,
         erase_title,
@@ -720,6 +812,9 @@ pub(super) fn build_review_page() -> ReviewPage {
         wifi,
         computer,
         user,
+        ssh_keys,
+        ssh_server,
+        git,
         locale,
         zone,
         keyboard,

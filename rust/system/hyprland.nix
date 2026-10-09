@@ -12,9 +12,9 @@ in
 {
   options.calamares.hyprland.enable = lib.mkEnableOption "Hyprland with its upstream default configuration";
   config = lib.mkMerge [
-    (lib.mkIf (cfg.hyprland.enable || cfg.omarchy.enable) {
+    (lib.mkIf cfg.hyprland.enable {
       # uwsm starts graphical-session.target (and the session's own units),
-      # which Hyprland alone never does.
+      # which Hyprland alone never does. Tatami's module does the same.
       programs.hyprland = {
         enable = true;
         withUWSM = true;

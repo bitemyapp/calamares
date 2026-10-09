@@ -5,7 +5,7 @@ let
   # must produce the same derivation wherever this directory lives.
   source = builtins.path {
     path = ./.;
-    name = "calamares-omarchy-tool-src";
+    name = "calamares-session-env-src";
     filter =
       path: _:
       !(builtins.elem (baseNameOf path) [
@@ -15,13 +15,13 @@ let
   };
 in
 rustPlatform.buildRustPackage {
-  pname = "calamares-omarchy-tool";
+  pname = "calamares-session-env";
   version = "0.1.0";
   src = source;
   cargoLock.lockFile = "${source}/Cargo.lock";
   meta = {
-    description = "Session launcher and desktop commands for Omarchy-style Hyprland";
+    description = "Keeps one desktop session's environment out of the next";
     license = lib.licenses.gpl3Plus;
-    mainProgram = "omarchy";
+    mainProgram = "calamares-session-env";
   };
 }

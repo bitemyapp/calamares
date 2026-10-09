@@ -22,10 +22,6 @@ impl DesktopSelection {
             );
         }
         ensure!(
-            !(selected.contains(&Desktop::Gnome) && selected.contains(&Desktop::Cinnamon)),
-            "GNOME and Cinnamon cannot currently be combined: their pinned NixOS modules conflict on GSettings overrides. Select one of those two; other desktops can be combined."
-        );
-        ensure!(
             selected.contains(&default),
             "The default session must be a selected desktop"
         );
@@ -45,40 +41,39 @@ impl DesktopSelection {
     }
 }
 
+/// The desktops the installer offers: the Wayland desktops, and Xfce as the
+/// one traditional X11 desktop. MATE, LXQt and Cinnamon are no longer
+/// offered (they duplicated Xfce's role and caused most cross-desktop
+/// interference); installed systems that have them keep working, since the
+/// NixOS module still accepts them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Desktop {
     Plasma,
     Gnome,
     Xfce,
-    Cinnamon,
-    Mate,
-    Lxqt,
     Hyprland,
-    /// Hyprland with an Omarchy-style configuration, as its own login session.
-    Omarchy,
+    /// Tatami: keyboard-driven Hyprland inspired by Omarchy, as its own login
+    /// session. Requests and configurations from before the rename say
+    /// "omarchy".
+    #[serde(alias = "omarchy")]
+    Tatami,
 }
 impl Desktop {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 5] = [
         Self::Plasma,
         Self::Gnome,
         Self::Xfce,
-        Self::Cinnamon,
-        Self::Mate,
-        Self::Lxqt,
         Self::Hyprland,
-        Self::Omarchy,
+        Self::Tatami,
     ];
     pub fn label(self) -> &'static str {
         match self {
             Self::Plasma => "KDE Plasma",
             Self::Gnome => "GNOME",
             Self::Xfce => "Xfce",
-            Self::Cinnamon => "Cinnamon",
-            Self::Mate => "MATE",
-            Self::Lxqt => "LXQt",
             Self::Hyprland => "Hyprland",
-            Self::Omarchy => "Omarchy-style Hyprland",
+            Self::Tatami => "Tatami",
         }
     }
     pub fn description(self) -> &'static str {
@@ -86,14 +81,11 @@ impl Desktop {
             Self::Plasma => "Full-featured and familiar, with deep customization.",
             Self::Gnome => "Focused, modern workflow built around the Activities overview.",
             Self::Xfce => "Lightweight and traditional; easy on older hardware.",
-            Self::Cinnamon => "Classic layout with a polished, modern feel.",
-            Self::Mate => "The traditional GNOME 2 desktop, steady and simple.",
-            Self::Lxqt => "Very lightweight Qt desktop.",
             Self::Hyprland => {
                 "Dynamic tiling Wayland compositor with its upstream default configuration."
             }
-            Self::Omarchy => {
-                "Keyboard-driven Hyprland in the style of Omarchy 4: its Tokyo Night look, menus and key bindings."
+            Self::Tatami => {
+                "Keyboard-driven Hyprland inspired by Omarchy: a Tokyo Night look, menus for everything and Omarchy's key bindings."
             }
         }
     }
@@ -103,11 +95,8 @@ impl Desktop {
             Self::Plasma => "plasma",
             Self::Gnome => "gnome",
             Self::Xfce => "xfce",
-            Self::Cinnamon => "cinnamon",
-            Self::Mate => "mate",
-            Self::Lxqt => "lxqt",
             Self::Hyprland => "hyprland",
-            Self::Omarchy => "omarchy",
+            Self::Tatami => "tatami",
         }
     }
 }
@@ -124,13 +113,11 @@ mod tests {
             );
         }
         let both =
-            DesktopSelection::parse(vec![Desktop::Hyprland, Desktop::Omarchy], Desktop::Omarchy)
+            DesktopSelection::parse(vec![Desktop::Hyprland, Desktop::Tatami], Desktop::Tatami)
                 .unwrap();
-        assert_eq!(both.default(), Desktop::Omarchy);
-        assert!(
-            DesktopSelection::parse(vec![Desktop::Gnome, Desktop::Cinnamon], Desktop::Gnome)
-                .is_err()
-        );
+        assert_eq!(both.default(), Desktop::Tatami);
+        // Requests naming desktops the installer no longer offers are refused.
+        assert!(serde_json::from_str::<Desktop>("\"mate\"").is_err());
         assert!(DesktopSelection::parse(vec![Desktop::Hyprland], Desktop::Plasma).is_err());
     }
 }

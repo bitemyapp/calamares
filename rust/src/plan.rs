@@ -42,6 +42,18 @@ pub struct RawRequest {
     /// NVIDIA GPUs the GUI found, for NVIDIA's driver and PRIME offload.
     #[serde(default)]
     pub graphics: crate::graphics::Graphics,
+    /// GitHub step (github.rs): the account whose public keys are
+    /// authorized, the keys, the SSH server and a Git identity. All optional.
+    #[serde(default)]
+    pub github_user: String,
+    #[serde(default)]
+    pub ssh_keys: Vec<String>,
+    #[serde(default)]
+    pub ssh_server: bool,
+    #[serde(default)]
+    pub git_name: String,
+    #[serde(default)]
+    pub git_email: String,
     pub confirmation: String,
 }
 impl Drop for RawRequest {
@@ -147,6 +159,7 @@ pub struct InstallPlan {
     swap: bool,
     tuning: bool,
     graphics: crate::graphics::Graphics,
+    onboarding: crate::github::Onboarding,
 }
 
 impl RawRequest {
@@ -192,6 +205,13 @@ impl RawRequest {
             &username,
         )?;
         self.graphics.check()?;
+        let onboarding = crate::github::Onboarding::parse(
+            &self.github_user,
+            &self.ssh_keys,
+            self.ssh_server,
+            &self.git_name,
+            &self.git_email,
+        )?;
         Ok(InstallPlan {
             settings: settings.clone(),
             disk: self.disk.clone(),
@@ -211,6 +231,7 @@ impl RawRequest {
             swap: self.swap,
             tuning: self.tuning,
             graphics: std::mem::take(&mut self.graphics),
+            onboarding,
         })
     }
 
@@ -273,6 +294,9 @@ impl InstallPlan {
     pub fn graphics(&self) -> &crate::graphics::Graphics {
         &self.graphics
     }
+    pub fn onboarding(&self) -> &crate::github::Onboarding {
+        &self.onboarding
+    }
     pub(crate) fn take_password(&mut self) -> Zeroizing<String> {
         Zeroizing::new(std::mem::take(&mut *self.password))
     }
@@ -326,6 +350,7 @@ impl ConfirmedInstall {
         let mut plan = self.0;
         let (copy_wifi, wifi_profiles) = plan.wifi.into_raw();
         let (desktops, default_desktop) = plan.desktops.into_raw();
+        let (github_user, ssh_keys, ssh_server, git_name, git_email) = plan.onboarding.into_raw();
         RawRequest {
             confirmation: format!("ERASE {}", plan.disk.path),
             disk: plan.disk,
@@ -347,6 +372,11 @@ impl ConfirmedInstall {
             swap: plan.swap,
             tuning: plan.tuning,
             graphics: plan.graphics,
+            github_user,
+            ssh_keys,
+            ssh_server,
+            git_name,
+            git_email,
         }
     }
 }

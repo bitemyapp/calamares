@@ -449,6 +449,8 @@ pub fn prepare(plan: &InstallPlan) -> Result<Prepared> {
 /// Destructive installation of a prepared, confirmed plan.
 pub fn execute(confirmed: ConfirmedInstall, prepared: Prepared) -> Result<()> {
     let started = Instant::now();
+    // From before the first disk write until the system is complete.
+    let awake = crate::power::stay_awake("Installing NixOS");
     let mut request = confirmed.into_plan();
     // The prepared files must be exactly what this confirmed plan generates.
     ensure!(
@@ -680,6 +682,7 @@ pub fn execute(confirmed: ConfirmedInstall, prepared: Prepared) -> Result<()> {
             .map(|(stage, seconds)| (stage.clone(), serde_json::json!(seconds)))
             .collect::<serde_json::Map<_, _>>(),
         "seconds_from_confirmation_before_flush": started.elapsed().as_secs_f64(),
+        "kept_awake": awake.held(),
     });
     let log_dir = target.0.join("var/log/calamares-nixos");
     fs::create_dir_all(&log_dir)?;

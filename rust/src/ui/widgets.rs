@@ -100,11 +100,8 @@ fn monogram_text(desktop: Desktop) -> &'static str {
         Desktop::Plasma => "K",
         Desktop::Gnome => "G",
         Desktop::Xfce => "X",
-        Desktop::Cinnamon => "C",
-        Desktop::Mate => "M",
-        Desktop::Lxqt => "LX",
         Desktop::Hyprland => "H",
-        Desktop::Omarchy => "Ω",
+        Desktop::Tatami => "T",
     }
 }
 

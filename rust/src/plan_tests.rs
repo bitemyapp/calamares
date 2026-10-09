@@ -53,6 +53,11 @@ fn fixture() -> (tempfile::TempDir, Settings, RawRequest) {
         swap: true,
         tuning: true,
         graphics: Default::default(),
+        github_user: String::new(),
+        ssh_keys: vec![],
+        ssh_server: false,
+        git_name: String::new(),
+        git_email: String::new(),
         confirmation: "ERASE /dev/vda".into(),
     };
     (dir, settings, request)
@@ -94,6 +99,58 @@ fn ipc_downgrades_to_raw_and_helper_parses_again() {
     let mut received: RawRequest = serde_json::from_slice(&json).unwrap();
     received.username = "root".into();
     assert!(received.parse_confirmed(&settings).is_err());
+}
+
+#[test]
+fn github_choices_survive_review_and_privileged_reparsing() {
+    const KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF8y4b2kcB5eEPbrb5tU80+lphiIk3o7v09PPFOqRtH3";
+    let (_dir, settings, mut raw) = fixture();
+    raw.github_user = "alice".into();
+    raw.ssh_keys = vec![KEY.into()];
+    raw.ssh_server = true;
+    raw.git_name = "Alice".into();
+    raw.git_email = "alice@example.com".into();
+    let plan = raw.parse(&settings).unwrap();
+    let expected = render(&plan);
+    assert!(expected.contains(KEY) && expected.contains("services.openssh"));
+    let wire = plan.confirm("ERASE /dev/vda").unwrap().into_request();
+    let encoded = serde_json::to_vec(&wire).unwrap();
+    let received: RawRequest = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(
+        render(&received.parse_confirmed(&settings).unwrap().into_plan()),
+        expected
+    );
+    // The helper rejects keys it would not write, whatever the GUI fetched.
+    let tampering: [fn(&mut RawRequest); 5] = [
+        |r: &mut RawRequest| r.github_user.clear(),
+        |r: &mut RawRequest| r.github_user = "-alice".into(),
+        |r: &mut RawRequest| r.ssh_keys.push("ssh-ed25519 AAAA\nrm -rf /".into()),
+        |r: &mut RawRequest| r.ssh_keys[0] = format!("command=\"sh\" {}", r.ssh_keys[0]),
+        |r: &mut RawRequest| r.git_email.clear(),
+    ];
+    for tamper in tampering {
+        let mut received: RawRequest = serde_json::from_slice(&encoded).unwrap();
+        tamper(&mut received);
+        assert!(received.parse_confirmed(&settings).is_err());
+    }
+    // Requests from before the GitHub step parse with none of it.
+    let mut old: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    for field in [
+        "github_user",
+        "ssh_keys",
+        "ssh_server",
+        "git_name",
+        "git_email",
+    ] {
+        old.as_object_mut().unwrap().remove(field);
+    }
+    let plan = serde_json::from_value::<RawRequest>(old)
+        .unwrap()
+        .parse_confirmed(&settings)
+        .unwrap()
+        .into_plan();
+    assert_eq!(plan.onboarding(), &github::Onboarding::default());
 }
 
 #[test]
@@ -144,14 +201,13 @@ fn omitted_applications_preserve_old_requests_but_empty_means_none() {
 #[test]
 fn every_desktop_subset_and_default_obeys_the_contract() {
     let mut supported = 0;
-    for bits in 0u16..256 {
+    for bits in 0u16..(1 << Desktop::ALL.len()) {
         let selected: Vec<_> = Desktop::ALL
             .iter()
             .enumerate()
             .filter_map(|(i, d)| (bits & (1 << i) != 0).then_some(*d))
             .collect();
-        let compatible = !(selected.is_empty()
-            || selected.contains(&Desktop::Gnome) && selected.contains(&Desktop::Cinnamon));
+        let compatible = !selected.is_empty();
         supported += usize::from(compatible);
         for default in Desktop::ALL {
             let parsed = DesktopSelection::parse(selected.clone(), default);
@@ -162,10 +218,10 @@ fn every_desktop_subset_and_default_obeys_the_contract() {
             }
         }
     }
-    // All nonempty subsets of eight desktops, less those with GNOME and Cinnamon.
-    assert_eq!(supported, 255 - 64);
+    // Every nonempty subset of the offered desktops.
+    assert_eq!(supported, (1 << Desktop::ALL.len()) - 1);
     assert!(DesktopSelection::parse(vec![Desktop::Plasma; 2], Desktop::Plasma).is_err());
-    assert!(DesktopSelection::parse(vec![Desktop::Plasma; 9], Desktop::Plasma).is_err());
+    assert!(DesktopSelection::parse(vec![Desktop::Plasma; 6], Desktop::Plasma).is_err());
 }
 
 #[test]
@@ -460,22 +516,31 @@ fn filesystem_choice_survives_review_confirmation_and_ipc() {
 
 #[test]
 fn nvidia_gpus_get_nvidia_driver_only_when_unfree_is_allowed() {
-    use graphics::{Graphics, Offload};
-    let laptop = Graphics {
+    use graphics::{Graphics, Integrated};
+    let hybrid = |offload| Graphics {
         nvidia: Some("PCI:1:0:0".into()),
-        offload: Some(Offload::Intel("PCI:0:2:0".into())),
+        integrated: Some(Integrated::Intel("PCI:0:2:0".into())),
+        offload,
     };
+    let prime =
+        "calamares.nvidia.prime = { nvidiaBusId = \"PCI:1:0:0\"; intelBusId = \"PCI:0:2:0\"; };";
+    // Displays on the Intel GPU: PRIME offload.
     let (_dir, settings, mut raw) = fixture();
     raw.allow_unfree = true;
-    raw.graphics = laptop.clone();
+    raw.graphics = hybrid(true);
     let text = render(&raw.parse(&settings).unwrap());
     assert!(text.contains("  calamares.nvidia.enable = true;\n"));
-    assert!(text.contains(
-        "  calamares.nvidia.prime = { nvidiaBusId = \"PCI:1:0:0\"; intelBusId = \"PCI:0:2:0\"; };\n"
-    ));
+    assert!(text.contains(&format!("\n  {prime}\n")));
+    // Panel on the NVIDIA GPU (MUX in discrete mode): NVIDIA is primary.
+    let (_dir, settings, mut raw) = fixture();
+    raw.allow_unfree = true;
+    raw.graphics = hybrid(false);
+    let text = render(&raw.parse(&settings).unwrap());
+    assert!(text.contains("  calamares.nvidia.enable = true;\n"));
+    assert!(!text.contains("calamares.nvidia.prime"));
     // Declining unfree packages keeps the open-source driver.
     let (_dir, settings, mut raw) = fixture();
-    raw.graphics = laptop;
+    raw.graphics = hybrid(true);
     let text = render(&raw.parse(&settings).unwrap());
     assert!(!text.contains("calamares.nvidia"));
     assert!(text.contains("its driver needs unfree packages"));
@@ -486,7 +551,8 @@ fn nvidia_gpus_get_nvidia_driver_only_when_unfree_is_allowed() {
     raw.allow_unfree = true;
     raw.graphics = Graphics {
         nvidia: Some("PCI:1:0:0\"; boot.kernelParams = [ \"x\" ]; #".into()),
-        offload: None,
+        integrated: None,
+        offload: false,
     };
     assert!(raw.parse(&settings).is_err());
 }

@@ -26,6 +26,12 @@ let
         name: (if (app.source or "nixpkgs") == "ai" then aiPackages else applicationPkgs).${name}
       ) app.packages;
   packages = lib.unique (lib.concatMap packagesFor selected);
+  # nixpkgs names Zed's Linux CLI `zeditor`, while Zed's docs and most user
+  # workflows invoke it as `zed`. Expose the expected command whenever the
+  # editor is selected in the installer.
+  zedCli = lib.optional (has "zed") (pkgs.writeShellScriptBin "zed" ''
+    exec ${applicationPkgs.zed-editor}/bin/zeditor "$@"
+  '');
   launchers = map (
     app:
     pkgs.makeDesktopItem {
@@ -114,7 +120,7 @@ in
         message = "Selected applications require allowing proprietary software.";
       }
     ];
-    environment.systemPackages = packages ++ launchers;
+    environment.systemPackages = packages ++ launchers ++ zedCli;
     environment.etc."installer-applications.json".text = builtins.toJSON {
       selected = ids;
       packages = map (package: {

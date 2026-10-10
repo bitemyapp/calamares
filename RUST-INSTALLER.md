@@ -442,7 +442,7 @@ and again when the helper parses the request. Required build tools cannot be
 deselected in the GUI while Rustup is selected.
 
 The build-tools choice includes wrapped GCC/G++ and libc headers, GNU Make,
-binutils, CMake, Ninja, pkg-config, Git, and patch. Rustup uses Nixpkgs' NixOS-aware
+binutils, CMake, Ninja, pkg-config, Git, patch, and `file`. Rustup uses Nixpkgs' NixOS-aware
 package; users select a toolchain with `rustup default stable` after installation.
 Additional native libraries should be provided by a project development shell.
 Docker Engine + Compose uses the rootless user service with lingering enabled;
